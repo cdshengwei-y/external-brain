@@ -287,6 +287,36 @@ python3 -m pip install -r requirements.txt
 python3 run.py --mqtt-host 127.0.0.1 --mqtt-port 1883
 ```
 
+如果要让 RK3588 通过 HTTP 控制当前 MQTT 录音豆，在同一个中枢进程中同时开启兼容桥：
+
+```bash
+python3 run.py \\
+  --host 0.0.0.0 \\
+  --mqtt-host 0.0.0.0 \\
+  --mqtt-port 1883 \\
+  --mqtt-client-id smart-hub-main \\
+  --bridge-host 0.0.0.0 \\
+  --bridge-port 19700
+```
+
+桥接接口为 `POST /command`，它接收 RK3588 硬件网关格式，并把 `command.action` 映射为现有中枢能力。桥接层会复用 `request_id` 作为本地 `command_id`，避免网络重试重复下发 MQTT 命令；只有收到真实设备 `succeeded` ack 才返回 `ok: true`。
+
+```bash
+curl -X POST http://127.0.0.1:19700/command \\
+  -H 'Content-Type: application/json' \\
+  -d '{
+    "request_id": "hub-20261010-0001",
+    "source": "rk3588",
+    "command": {
+      "device_id": "bean_ye_1",
+      "action": "record.start",
+      "params": {}
+    }
+  }'
+```
+
+桥接服务健康检查：`GET http://127.0.0.1:19700/health`。
+
 注册一个测试设备：
 
 ```bash

@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import queue
+import os
 import shutil
 import socket
 import subprocess
 import sys
 import time
 import uuid
+import urllib.error
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
@@ -24,36 +27,66 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from agent_gateway import AgentGatewayError, HubApiClient, TextAgent
+from agent_gateway import (
+    AgentGatewayError,
+    HubApiClient,
+    RK3588AgentClient,
+    RK3588DeviceRegistration,
+    RK3588DeviceRegistrar,
+    TextAgent,
+)
 from desktop_app.device_cards import DeviceCardWall, device_display_name, is_real_device
 from desktop_app.jarvis_panel import JarvisPanel
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 HUB_URL = "http://127.0.0.1:18787"
+BRIDGE_HEALTH_URL = "http://127.0.0.1:19700/health"
 BROKER_HOST = "127.0.0.1"
 BROKER_PORT = 1883
+RK3588_BASE_URL = os.getenv("RK3588_BASE_URL", "http://192.168.0.140:8095")
+PUBLIC_BRIDGE_BASE_URL = os.getenv(
+    "HUB_BRIDGE_PUBLIC_URL",
+    "http://192.168.0.107:19700",
+)
+REGISTER_DEVICE_ID = os.getenv("HUB_REGISTER_DEVICE_ID", "bean_ye_1")
+REGISTER_DEVICE_NAME = os.getenv("HUB_REGISTER_DEVICE_NAME", "录音豆")
+REGISTER_DEVICE_CAPABILITIES = tuple(
+    capability.strip()
+    for capability in os.getenv(
+        "HUB_REGISTER_DEVICE_CAPABILITIES",
+        "record.start,record.stop,status.read",
+    ).split(",")
+    if capability.strip()
+)
 
 
 class HubRuntime:
-    def __init__(self) -> None:
+    def __init__(self, registrar: Optional[RK3588DeviceRegistrar] = None) -> None:
         self.broker_process: Optional[subprocess.Popen[Any]] = None
         self.hub_process: Optional[subprocess.Popen[Any]] = None
+        self.bridge_process: Optional[subprocess.Popen[Any]] = None
+        self.registrar = registrar
 
     def ensure_started(self) -> None:
         if not self._port_open(BROKER_HOST, BROKER_PORT):
             self._start_broker()
         if not self._health_ok():
             self._start_hub()
+        if not self._bridge_health_ok() and self.hub_process is None:
+            self._start_bridge_sidecar()
         deadline = time.monotonic() + 15
         while time.monotonic() < deadline:
-            if self._health_ok():
+            if self._health_ok() and self._bridge_health_ok():
+                self._start_device_registrar()
                 return
             time.sleep(0.25)
-        raise RuntimeError("智能中枢未能启动，请检查 MQTT Broker 和本地服务日志。")
+        raise RuntimeError("智能中枢或 HTTP-MQTT 兼容桥未能启动，请检查本地服务日志。")
 
     def stop_started_processes(self) -> None:
-        for process in (self.hub_process, self.broker_process):
+        if self.registrar is not None:
+            self.registrar.stop()
+        for process in (self.bridge_process, self.hub_process, self.broker_process):
             if process is None or process.poll() is not None:
                 continue
             process.terminate()
@@ -61,6 +94,19 @@ class HubRuntime:
                 process.wait(timeout=3)
             except subprocess.TimeoutExpired:
                 process.kill()
+
+    def _start_device_registrar(self) -> None:
+        if self.registrar is None:
+            self.registrar = RK3588DeviceRegistrar(
+                RK3588AgentClient(RK3588_BASE_URL, timeout_seconds=3.0),
+                RK3588DeviceRegistration(
+                    device_id=REGISTER_DEVICE_ID,
+                    name=REGISTER_DEVICE_NAME,
+                    base_url=PUBLIC_BRIDGE_BASE_URL,
+                    capabilities=REGISTER_DEVICE_CAPABILITIES,
+                ),
+            )
+        self.registrar.start()
 
     def _start_broker(self) -> None:
         executable = shutil.which("mosquitto")
@@ -99,6 +145,41 @@ class HubRuntime:
                 "127.0.0.1",
                 "--mqtt-port",
                 "1883",
+                "--mqtt-client-id",
+                "smart-hub-desktop",
+                "--bridge-host",
+                "0.0.0.0",
+                "--bridge-port",
+                "19700",
+            ],
+            cwd=PROJECT_ROOT,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+
+    def _start_bridge_sidecar(self) -> None:
+        database = PROJECT_ROOT / ".data" / "hub.db"
+        self.bridge_process = subprocess.Popen(
+            [
+                sys.executable,
+                str(PROJECT_ROOT / "run.py"),
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "18788",
+                "--db",
+                str(database),
+                "--mqtt-host",
+                "127.0.0.1",
+                "--mqtt-port",
+                "1883",
+                "--mqtt-client-id",
+                "smart-hub-desktop-bridge",
+                "--bridge-host",
+                "0.0.0.0",
+                "--bridge-port",
+                "19700",
             ],
             cwd=PROJECT_ROOT,
             stdout=subprocess.DEVNULL,
@@ -120,6 +201,14 @@ class HubRuntime:
             HubApiClient(HUB_URL, timeout_seconds=1).health()
             return True
         except AgentGatewayError:
+            return False
+
+    @staticmethod
+    def _bridge_health_ok() -> bool:
+        try:
+            with urllib.request.urlopen(BRIDGE_HEALTH_URL, timeout=1) as response:
+                return response.status == 200
+        except (urllib.error.URLError, TimeoutError, OSError):
             return False
 
 
