@@ -1,0 +1,6 @@
+.data/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+firmware/esp32_recording_beam_template/.pio/
+firmware/esp32_recording_beam_template/src/config.h
