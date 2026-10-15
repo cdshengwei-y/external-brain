@@ -1,0 +1,39 @@
+{
+  "package_version": "1.0",
+  "device_id": "bean_ye_1",
+  "name": "录音豆",
+  "device_type": "audio-recorder",
+  "location": "",
+  "capabilities": [
+    {
+      "name": "record.start",
+      "label": "开始录音",
+      "description": "打开麦克风并进入录音状态。",
+      "params_schema": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "record.stop",
+      "label": "停止录音",
+      "description": "停止采集并在文件关闭保存后确认完成。",
+      "params_schema": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "status.read",
+      "label": "读取录音状态",
+      "description": "读取设备当前真实状态，不改变设备状态。",
+      "params_schema": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+      }
+    }
+  ]
+}

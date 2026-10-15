@@ -165,6 +165,37 @@ class HubServiceTest(unittest.TestCase):
             "online",
         )
 
+    def test_mqtt_manifest_does_not_mark_new_device_online_without_availability(self):
+        self.service.handle_mqtt_message(
+            "hub/v1/devices/mqtt-beam-002/manifest",
+            {
+                "device_id": "mqtt-beam-002",
+                "device_type": "recording_beam",
+                "protocol_version": "1.0",
+                "capabilities": ["indicator.set"],
+            },
+        )
+
+        self.assertEqual(
+            self.service.get_device("mqtt-beam-002")["status"],
+            "offline",
+        )
+
+    def test_retained_state_does_not_mark_offline_device_online(self):
+        self.service.update_availability(
+            "recording-beam-001",
+            {"status": "offline"},
+        )
+        self.service.ingest_state(
+            "recording-beam-001",
+            {"recording": False},
+        )
+
+        self.assertEqual(
+            self.service.get_device("recording-beam-001")["status"],
+            "offline",
+        )
+
     def test_latest_device_state_is_persisted_and_returned(self):
         self.assertEqual(
             self.service.get_device_state("recording-beam-001"),
@@ -194,6 +225,18 @@ class HubServiceTest(unittest.TestCase):
         self.assertEqual(state["sd_free_mb"], 7570)
         self.assertEqual(state["wifi_ip"], "192.168.0.125")
         self.assertIsNotNone(state["updated_at"])
+
+    def test_persisted_online_devices_are_reset_without_changing_last_seen(self):
+        device_before = self.service.get_device("recording-beam-001")
+        self.assertEqual(device_before["status"], "online")
+        last_seen = device_before["last_seen"]
+
+        changed = self.service.mark_persisted_devices_offline()
+
+        self.assertEqual(changed, 1)
+        device_after = self.service.get_device("recording-beam-001")
+        self.assertEqual(device_after["status"], "offline")
+        self.assertEqual(device_after["last_seen"], last_seen)
 
 
 if __name__ == "__main__":

@@ -1,6 +1,6 @@
-# 第一阶段文字智能体
+# RK3588 网关与中枢适配
 
-第一阶段的文字智能体由真实设备上位机调用。用户在上位机窗口输入中文，`TextAgent` 将当前支持的意图转换为中枢命令，再等待真实设备返回最终状态。
+上位机不再把中文直接转换成硬件命令。所有用户消息先由 `RK3588AgentClient.route_message()` 发送到 RK3588 的 `task=auto` 自动路由；只有路由结果为硬件命令且返回结构化 `plan_id` 时，才进入用户确认和执行流程。
 
 当前支持：
 
@@ -9,7 +9,9 @@
 - 查询状态；
 - 查看设备。
 
-上位机入口位于项目根目录的 `外接大脑上位机.app`。后续接入大模型时，只替换 `TextAgent` 的意图解析部分，继续复用中枢 API、命令 ID、等待结果机制和真实 MQTT 硬件协议。
+桌面端回复语音当前使用 macOS 系统 TTS（`say` + `afplay`）按需生成和播放，便于先验证界面交互。RK3588 的 TTS 适配器已保留，后续可在服务速度稳定后切换。
+
+上位机入口位于项目根目录的 `外接大脑上位机.app`。当前 RK3588 的 `dispatch=false` 规划接口仍需同事完成稳定性联调；接口未返回合法 `plan_id` 时，上位机会失败提示，不会绕过规划直接控制硬件。
 
 随身设备接口已经提供第一版文字和音频入口：
 
@@ -17,23 +19,31 @@
 POST /api/v1/portable/v1/media
 POST /api/v1/portable/v1/requests
 GET  /api/v1/portable/v1/requests/{request_id}
+POST /api/v1/portable/v1/requests/{request_id}/confirm
 ```
 
-当前音频只完成上传和持久化，尚未接入中枢音频理解适配器；未配置音频理解时会明确返回 `AUDIO_UNDERSTANDING_NOT_CONFIGURED`，不会执行硬件命令。
+音频请求会从 SQLite 读取已上传的音频，转换为千问 ASR 服务所需的 `multipart/form-data`，调用 `http://192.168.0.153:18005/transcribe` 的 `file` 字段获取文字，再把文字送入 RK3588 的 `POST /api/route` 自动路由。转写结果会保存到请求的 `transcript` 字段；未配置音频理解时会明确返回 `AUDIO_UNDERSTANDING_NOT_CONFIGURED`，不会执行硬件命令。
+
+已确认的千问 ASR 服务地址为 `http://192.168.0.153:18005`，提供：
+
+```text
+GET  /health
+POST /transcribe     multipart 字段：file、language
+```
 
 已确认的 RK3588 测试中枢服务地址为 `http://192.168.0.140:8095`，提供：
 
 ```text
 GET  /api/health
 GET  /api/mode
-POST /api/agent
+POST /api/route
 POST /api/asr
 POST /api/tts
 ```
 
-项目中的 `RK3588AgentClient` 只负责调用这些 AI 能力并提取显式结构化动作；硬件命令仍然必须交给 `HubService` 做能力、权限、队列和 MQTT 校验。
+项目中的 `RK3588AgentClient` 统一使用 `protocol_version`、`request_id`、`conversation_id`、`target_device_id`、`plan_id` 和 `source`；硬件命令仍然必须交给 `HubService` 做能力、权限、队列和 MQTT 校验。
 
-硬件接入应优先使用 RK3588 硬件网关接口，而不是直接解析通用 `/api/agent` 的自然语言回复：
+桌面聊天入口必须使用带 V1 上下文的 `/api/route` 自动路由，不应在桌面端自行判断聊天和命令。RK3588 自动路由返回聊天时直接展示，返回硬件计划时再交给硬件网关接口执行。旧版 `/api/agent` 仅作为历史通用智能体接口，不作为当前硬件联调入口：
 
 ```text
 GET  /api/hub/v1/health

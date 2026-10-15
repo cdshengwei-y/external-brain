@@ -1,0 +1,47 @@
+{
+  "protocol_version": "1.0",
+  "package_type": "smart_home_device",
+  "package_id": "bean_ye_1_package",
+  "package_version": "1.0.0",
+  "manifest": {
+    "device_id": "bean_ye_1",
+    "name": "录音豆",
+    "device_type": "audio-recorder",
+    "location": "",
+    "vendor": "external-brain",
+    "description": "通过 Wi-Fi + MQTT 接入智能中枢的录音设备。公开包只描述身份和能力，不包含网络地址、MQTT 凭据或令牌。",
+    "package_version": "1.0.0",
+    "capabilities": [
+      {
+        "name": "record.start",
+        "label": "开始录音",
+        "description": "打开麦克风并进入录音状态。只有收到设备真实成功 ack 后才能报告完成。",
+        "params_schema": {
+          "type": "object",
+          "properties": {},
+          "additionalProperties": false
+        }
+      },
+      {
+        "name": "record.stop",
+        "label": "停止录音",
+        "description": "停止采集，并在录音文件关闭保存后确认完成。",
+        "params_schema": {
+          "type": "object",
+          "properties": {},
+          "additionalProperties": false
+        }
+      },
+      {
+        "name": "status.read",
+        "label": "读取录音状态",
+        "description": "读取当前真实录音状态，不改变设备状态。",
+        "params_schema": {
+          "type": "object",
+          "properties": {},
+          "additionalProperties": false
+        }
+      }
+    ]
+  }
+}

@@ -1,74 +1,97 @@
 from __future__ import annotations
 
+import base64
 import threading
 import uuid
 from concurrent.futures import Future, ThreadPoolExecutor
-from typing import Any, Dict, Optional
+from datetime import datetime, timezone
+from typing import Any, Dict, Optional, Protocol
 
 from hub_core.errors import ConflictError, HubError, ValidationError
 from hub_core.service import HubService
 
+from .qwen_asr import QwenAsrClient
+from .rk3588 import RK3588AgentClient
 from .service import AgentGatewayError, TextAgent
 
 
-class LocalHubApiClient:
-    """Adapts HubService to the interface consumed by TextAgent."""
-
-    def __init__(self, service: HubService) -> None:
-        self.service = service
-
-    def list_devices(self) -> list:
-        return self.service.list_devices()
-
-    def get_device_state(self, device_id: str) -> Dict[str, Any]:
-        return self.service.get_device_state(device_id)
-
-    def submit_command(
+class HardwarePlanProvider(Protocol):
+    def plan_hub_command(
         self,
-        device_id: str,
-        capability: str,
-        params: Optional[Dict[str, Any]],
+        request_id: str,
         conversation_id: str,
-        policy: str,
+        input_text: str,
+        target_device_id: str,
+        source: str,
     ) -> Dict[str, Any]:
-        return self.service.submit_command(
-            device_id,
-            {
-                "conversation_id": conversation_id,
-                "capability": capability,
-                "params": params or {},
-                "policy": policy,
-            },
-        )
+        ...
 
-    def wait_for_command(
+    def dispatch_hub_command(
         self,
-        command_id: str,
-        timeout_ms: int = 30000,
+        request_id: str,
+        conversation_id: str,
+        plan_id: str,
+        target_device_id: str,
+        source: str,
     ) -> Dict[str, Any]:
-        command = self.service.wait_for_command(command_id, timeout_ms / 1000)
-        completed = command["state"] in {
-            "succeeded",
-            "failed",
-            "cancelled",
-            "superseded",
-            "expired",
-        }
-        return {
-            "command": command,
-            "completed": completed,
-            "timed_out": not completed,
-        }
+        ...
+
+
+class AudioTranscriptionProvider(Protocol):
+    def transcribe(self, audio_data_url: str) -> Dict[str, Any]:
+        ...
+
+
+class MessageRouteProvider(Protocol):
+    def route_message(
+        self,
+        request_id: str,
+        conversation_id: str,
+        input_text: str,
+        target_device_id: Optional[str],
+        source: str,
+    ) -> Dict[str, Any]:
+        ...
+
+
+class PortableAudioError(RuntimeError):
+    def __init__(self, code: str, message: str, retryable: bool = False) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.retryable = retryable
 
 
 class PortableRequestService:
+    PLAN_TTL_SECONDS = 300
+
     """Accepts portable-device requests and processes them asynchronously."""
 
     MAX_MEDIA_BYTES = 10 * 1024 * 1024
     SUPPORTED_INPUT_TYPES = {"text", "audio"}
 
-    def __init__(self, hub: HubService, max_workers: int = 4) -> None:
+    def __init__(
+        self,
+        hub: HubService,
+        plan_provider: Optional["HardwarePlanProvider"] = None,
+        transcription_provider: Optional["AudioTranscriptionProvider"] = None,
+        route_provider: Optional["MessageRouteProvider"] = None,
+        max_workers: int = 4,
+    ) -> None:
         self.hub = hub
+        if plan_provider is None:
+            rk3588_client = RK3588AgentClient(timeout_seconds=30.0)
+            self.plan_provider = rk3588_client
+            self.transcription_provider = transcription_provider or QwenAsrClient()
+            self.route_provider = route_provider or rk3588_client
+        else:
+            self.plan_provider = plan_provider
+            self.transcription_provider = transcription_provider
+            self.route_provider = route_provider or (
+                plan_provider
+                if callable(getattr(plan_provider, "route_message", None))
+                else None
+            )
         self._lock = threading.RLock()
         self._executor = ThreadPoolExecutor(
             max_workers=max_workers,
@@ -138,6 +161,38 @@ class PortableRequestService:
             raise HubError(f"请求不存在: {request_id}", status_code=404)
         return self._public_request(request)
 
+    def confirm(self, request_id: str, plan_id: str) -> Dict[str, Any]:
+        request = self.hub.store.get_portable_request(request_id)
+        if request is None:
+            raise HubError(f"请求不存在: {request_id}", status_code=404)
+        if request.get("state") != "planned":
+            raise ConflictError("当前请求不处于待确认状态")
+        if request.get("plan_id") != plan_id:
+            raise ConflictError("plan_id 与当前计划不匹配")
+        if self._plan_expired(request):
+            self._update(
+                request_id,
+                state="failed",
+                error_code="PLAN_EXPIRED",
+                error_message="计划已过期，请重新发起请求。",
+                response_text="计划已过期，请重新发起请求。",
+            )
+            raise ConflictError("计划已过期，请重新发起请求")
+
+        self._update(
+            request_id,
+            state="confirming",
+            response_text="已确认，正在执行计划…",
+        )
+        with self._lock:
+            self._futures[request_id] = self._executor.submit(
+                self._execute_planned_request,
+                request_id,
+            )
+        return self._public_request(
+            self.hub.store.get_portable_request(request_id)  # type: ignore[arg-type]
+        )
+
     def _process_request(self, request_id: str) -> None:
         request = self.hub.store.get_portable_request(request_id)
         if request is None:
@@ -145,54 +200,88 @@ class PortableRequestService:
         try:
             if request["input_type"] == "audio":
                 self._update(request_id, state="transcribing")
+                text = self._transcribe_request(request_id, request)
+            else:
+                text = request.get("text") or ""
+            self._update(request_id, state="understanding")
+            if TextAgent._is_list_devices_request(text):
                 self._update(
                     request_id,
-                    state="failed",
-                    error_code="AUDIO_UNDERSTANDING_NOT_CONFIGURED",
-                    error_message="音频已收到，但固定式中枢尚未配置音频理解能力。",
-                    response_text="音频已收到，但固定式中枢尚未配置音频理解能力。",
-                    retryable=True,
+                    state="completed",
+                    response_text=TextAgent._format_devices(self.hub.list_devices()),
                 )
                 return
-            self._update(request_id, state="understanding")
-            text = request.get("text") or ""
-            capability = TextAgent._match_capability(text)
-            intent = None
-            if capability is not None:
-                device_id = request.get("target_device_id")
+            target_device_id = request.get("target_device_id")
+            if self.route_provider is not None:
+                response = self.route_provider.route_message(
+                    request_id=request_id,
+                    conversation_id=request["conversation_id"],
+                    input_text=text,
+                    target_device_id=target_device_id,
+                    source="portable",
+                )
+                route = str(response.get("route") or "").strip().lower()
+                if route in {"chat", "clarification", "assistant"}:
+                    self._update(
+                        request_id,
+                        state="completed",
+                        response_text=self._route_reply(
+                            response,
+                            "我暂时没有可用的回复。",
+                        ),
+                    )
+                    return
+                if not self._is_plan_response(response, route):
+                    if self._route_reply(response, ""):
+                        self._update(
+                            request_id,
+                            state="completed",
+                            response_text=self._route_reply(response, ""),
+                        )
+                        return
+                    raise HubError(
+                        "RK3588 自动路由没有返回聊天回复或结构化计划",
+                        status_code=502,
+                    )
+                device_id = target_device_id or self._resolve_device_id()
+            else:
+                device_id = target_device_id or self._resolve_device_id()
                 if not device_id:
-                    device_id = self._resolve_device_id()
-                intent = {
-                    "capability": capability,
-                    "device_id": device_id,
-                    "params": {},
-                }
-            self._update(request_id, state="planned", intent=intent)
-
-            agent = TextAgent(
-                LocalHubApiClient(self.hub),
-                device_id=request.get("target_device_id"),
-                conversation_id=request["conversation_id"],
-                on_command_submitted=lambda command: self._mark_command_submitted(
-                    request_id,
-                    command,
-                ),
-            )
-            response_text = agent.respond(text)
-            request_state = self._request_state(agent)
-            result = None
-            if agent.command_id:
-                command = self.hub.get_command(agent.command_id)
-                result = command.get("result")
+                    raise HubError("当前没有可用的真实设备", status_code=503)
+                response = self.plan_provider.plan_hub_command(
+                    request_id=request_id,
+                    conversation_id=request["conversation_id"],
+                    input_text=text,
+                    target_device_id=device_id,
+                    source="portable",
+                )
+            if not device_id:
+                raise HubError("当前没有可用的真实设备", status_code=503)
+            plan_id = response.get("plan_id")
+            command = response.get("command") or {}
+            if not isinstance(command, dict) and isinstance(response.get("plan"), dict):
+                command = response["plan"].get("command") or {}
+            if (
+                not self._is_plan_response(response, str(response.get("route") or ""))
+                or not isinstance(plan_id, str)
+                or not isinstance(command, dict)
+                or not isinstance(command.get("capability"), str)
+            ):
+                raise HubError("RK3588 未返回有效的结构化计划", status_code=502)
+            intent = {
+                "capability": command["capability"],
+                "device_id": command.get("device_id") or device_id,
+                "params": command.get("params") or {},
+            }
             self._update(
                 request_id,
-                state=request_state,
-                command_id=agent.command_id,
-                response_text=response_text,
-                result=result,
-                error_code=("COMMAND_FAILED" if request_state == "failed" else None),
-                error_message=(response_text if request_state == "failed" else None),
-                retryable=request_state in {"queued", "timed_out"},
+                state="planned",
+                intent=intent,
+                plan_id=plan_id,
+                response_text=self._response_message(
+                    response,
+                    "计划已生成，请确认执行。",
+                ),
             )
         except (ValidationError, ConflictError) as error:
             self._update(
@@ -211,6 +300,15 @@ class PortableRequestService:
                 response_text=str(error),
                 retryable=True,
             )
+        except PortableAudioError as error:
+            self._update(
+                request_id,
+                state="failed",
+                error_code=error.code,
+                error_message=error.message,
+                response_text=error.message,
+                retryable=error.retryable,
+            )
         except Exception as error:  # pragma: no cover - defensive worker boundary
             self._update(
                 request_id,
@@ -224,18 +322,57 @@ class PortableRequestService:
             with self._lock:
                 self._futures.pop(request_id, None)
 
-    def _mark_command_submitted(
-        self,
-        request_id: str,
-        command: Dict[str, Any],
-    ) -> None:
-        command_state = command.get("state")
-        request_state = "queued" if command_state == "queued" else "executing"
-        self._update(
-            request_id,
-            state=request_state,
-            command_id=command.get("command_id"),
-        )
+    def _execute_planned_request(self, request_id: str) -> None:
+        try:
+            request = self.hub.store.get_portable_request(request_id)
+            if request is None or not isinstance(request.get("intent"), dict):
+                raise HubError("计划不存在或内容无效", status_code=409)
+            intent = request["intent"]
+            device_id = str(intent.get("device_id") or "")
+            response = self.plan_provider.dispatch_hub_command(
+                request_id=f"execute-{uuid.uuid4()}",
+                conversation_id=request["conversation_id"],
+                plan_id=str(request["plan_id"]),
+                target_device_id=device_id,
+                source="portable",
+            )
+            state = str(response.get("state") or response.get("status") or "")
+            success = bool(response.get("ok")) or state == "succeeded"
+            request_state = self._request_state_from_response(response, success)
+            self._update(
+                request_id,
+                state=request_state,
+                command_id=response.get("command_id"),
+                response_text=self._response_message(response, "执行结果已返回。"),
+                result=response.get("result"),
+                error_code=("COMMAND_FAILED" if not success else None),
+                error_message=(
+                    self._response_message(response, "设备执行失败。")
+                    if not success
+                    else None
+                ),
+                retryable=request_state in {"queued", "executing", "timed_out"},
+            )
+        except (ValidationError, ConflictError) as error:
+            self._update(
+                request_id,
+                state="failed",
+                error_code="COMMAND_FAILED",
+                error_message=error.message,
+                response_text=error.message,
+            )
+        except (AgentGatewayError, HubError) as error:
+            self._update(
+                request_id,
+                state="failed",
+                error_code="HUB_UNAVAILABLE",
+                error_message=str(error),
+                response_text=str(error),
+                retryable=True,
+            )
+        finally:
+            with self._lock:
+                self._futures.pop(request_id, None)
 
     def _update(self, request_id: str, **changes: Any) -> Dict[str, Any]:
         request = self.hub.store.update_portable_request(request_id, **changes)
@@ -262,15 +399,138 @@ class PortableRequestService:
         return None
 
     @staticmethod
-    def _request_state(agent: TextAgent) -> str:
-        if agent.command_id is None:
-            return "completed"
-        return {
-            "success": "succeeded",
-            "queued": "queued",
-            "timeout": "timed_out",
-            "failure": "failed",
-        }.get(agent.response_status, "failed")
+    def _request_state_from_response(
+        response: Dict[str, Any],
+        success: bool,
+    ) -> str:
+        state = str(response.get("state") or response.get("status") or "")
+        if response.get("timed_out") and not success:
+            return "timed_out"
+        if success:
+            return "succeeded"
+        if state in {"queued", "accepted", "running", "pending"}:
+            return "queued"
+        return "failed"
+
+    @staticmethod
+    def _response_message(response: Dict[str, Any], fallback: str) -> str:
+        for key in ("reply", "message", "content"):
+            value = response.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return fallback
+
+    @staticmethod
+    def _route_reply(response: Dict[str, Any], fallback: str) -> str:
+        value = response.get("reply")
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+        return fallback
+
+    @staticmethod
+    def _is_plan_response(response: Dict[str, Any], route: str) -> bool:
+        return response.get("status") == "planned" or route in {
+            "command",
+            "hardware",
+            "tool",
+        }
+
+    def _transcribe_request(
+        self,
+        request_id: str,
+        request: Dict[str, Any],
+    ) -> str:
+        provider = self.transcription_provider
+        if provider is None:
+            raise PortableAudioError(
+                "AUDIO_UNDERSTANDING_NOT_CONFIGURED",
+                "音频已收到，但固定式中枢尚未配置音频理解能力。",
+                retryable=True,
+            )
+
+        media_id = request.get("media_id")
+        media = self.hub.store.get_portable_media(str(media_id or ""))
+        if media is None or media.get("media_type") != "audio":
+            raise PortableAudioError(
+                "AUDIO_MEDIA_NOT_FOUND",
+                "找不到请求对应的音频内容。",
+            )
+        if media.get("portable_device_id") != request.get("portable_device_id"):
+            raise PortableAudioError(
+                "AUDIO_MEDIA_DEVICE_MISMATCH",
+                "音频所属随身设备与当前请求不一致。",
+            )
+        data = media.get("data")
+        if not isinstance(data, (bytes, bytearray)) or not data:
+            raise PortableAudioError(
+                "AUDIO_MEDIA_EMPTY",
+                "请求对应的音频内容为空。",
+            )
+
+        content_type = str(media.get("content_type") or "").split(";", 1)[0].strip()
+        content_type = content_type or self._audio_content_type(media.get("audio_format"))
+        audio_data_url = (
+            f"data:{content_type};base64,"
+            f"{base64.b64encode(bytes(data)).decode('ascii')}"
+        )
+        try:
+            response = provider.transcribe(audio_data_url)
+        except Exception as error:
+            raise PortableAudioError(
+                "AUDIO_TRANSCRIPTION_FAILED",
+                f"音频转写失败：{error}",
+                retryable=True,
+            ) from error
+
+        transcript = self._extract_transcript(response)
+        if not transcript:
+            raise PortableAudioError(
+                "AUDIO_TRANSCRIPTION_EMPTY",
+                "音频转写未返回可用文字。",
+                retryable=True,
+            )
+        self._update(request_id, transcript=transcript)
+        return transcript
+
+    @staticmethod
+    def _audio_content_type(audio_format: Any) -> str:
+        formats = {
+            "wav": "audio/wav",
+            "wave": "audio/wav",
+            "mp3": "audio/mpeg",
+            "m4a": "audio/mp4",
+            "aac": "audio/aac",
+            "ogg": "audio/ogg",
+            "opus": "audio/opus",
+            "webm": "audio/webm",
+            "pcm": "audio/pcm",
+        }
+        normalized = str(audio_format or "").strip().lower().lstrip(".")
+        return formats.get(normalized, "application/octet-stream")
+
+    @classmethod
+    def _extract_transcript(cls, response: Any) -> str:
+        if isinstance(response, str):
+            return response.strip()
+        if not isinstance(response, dict):
+            return ""
+        for key in ("transcript", "text", "recognized_text", "content"):
+            value = response.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        for key in ("result", "data", "output", "response"):
+            nested = response.get(key)
+            transcript = cls._extract_transcript(nested)
+            if transcript:
+                return transcript
+        return ""
+
+    def _plan_expired(self, request: Dict[str, Any]) -> bool:
+        updated_at = request.get("updated_at")
+        if not isinstance(updated_at, str):
+            return True
+        created = datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
+        return (datetime.now(timezone.utc) - created).total_seconds() > self.PLAN_TTL_SECONDS
 
     @staticmethod
     def _validate_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -288,6 +548,14 @@ class PortableRequestService:
             if not isinstance(value, str) or not value.strip():
                 raise ValidationError(f"{key} 必须是非空字符串")
             values[key] = value.strip()
+        protocol_version = payload.get("protocol_version", "1.0")
+        if protocol_version != "1.0":
+            raise ValidationError("protocol_version 必须是 1.0")
+        source = payload.get("source", "portable")
+        if not isinstance(source, str) or not source.strip():
+            raise ValidationError("source 必须是非空字符串")
+        values["protocol_version"] = "1.0"
+        values["source"] = source.strip()
         text = payload.get("text")
         media_id = payload.get("media_id")
         if values["input_type"] == "text":
@@ -317,6 +585,8 @@ class PortableRequestService:
         for key in (
             "portable_device_id",
             "conversation_id",
+            "protocol_version",
+            "source",
             "input_type",
             "text",
             "media_id",

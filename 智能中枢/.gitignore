@@ -4,3 +4,5 @@ __pycache__/
 .pytest_cache/
 firmware/esp32_recording_beam_template/.pio/
 firmware/esp32_recording_beam_template/src/config.h
+firmware/sparkbot_wearable/.pio/
+firmware/sparkbot_wearable/include/wifi_config.h

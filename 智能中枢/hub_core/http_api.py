@@ -103,6 +103,18 @@ class HubRequestHandler(BaseHTTPRequestHandler):
                 request = self.portable_service.submit(payload)
                 self._send_json(202, request)
                 return
+            if (
+                parsed.path.startswith("/api/v1/portable/v1/requests/")
+                and parsed.path.endswith("/confirm")
+            ):
+                parts = parsed.path.strip("/").split("/")
+                request_id = parts[-2]
+                plan_id = payload.get("plan_id")
+                if not isinstance(plan_id, str) or not plan_id.strip():
+                    raise ValidationError("plan_id 必须是非空字符串")
+                request = self.portable_service.confirm(request_id, plan_id.strip())
+                self._send_json(202, request)
+                return
             if parsed.path == "/internal/v1/devices/register":
                 self._send_json(201, self.service.register_device(payload))
                 return

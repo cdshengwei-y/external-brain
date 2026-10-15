@@ -28,6 +28,45 @@ class HubApiClient:
     def health(self) -> Dict[str, Any]:
         return self._request("GET", "/api/v1/health")
 
+    def upload_portable_media(
+        self,
+        portable_device_id: str,
+        data: bytes,
+        audio_format: str,
+        content_type: str,
+    ) -> Dict[str, Any]:
+        return self._request(
+            "POST",
+            "/api/v1/portable/v1/media",
+            raw_body=data,
+            extra_headers={
+                "X-Portable-Device-Id": portable_device_id,
+                "X-Media-Type": "audio",
+                "X-Audio-Format": audio_format,
+                "Content-Type": content_type,
+            },
+        )
+
+    def submit_portable_request(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        return self._request("POST", "/api/v1/portable/v1/requests", payload)
+
+    def get_portable_request(self, request_id: str) -> Dict[str, Any]:
+        return self._request(
+            "GET",
+            f"/api/v1/portable/v1/requests/{request_id}",
+        )
+
+    def confirm_portable_request(
+        self,
+        request_id: str,
+        plan_id: str,
+    ) -> Dict[str, Any]:
+        return self._request(
+            "POST",
+            f"/api/v1/portable/v1/requests/{request_id}/confirm",
+            {"plan_id": plan_id},
+        )
+
     def submit_command(
         self,
         device_id: str,
@@ -64,10 +103,16 @@ class HubApiClient:
         path: str,
         payload: Optional[Dict[str, Any]] = None,
         timeout_seconds: Optional[float] = None,
+        raw_body: Optional[bytes] = None,
+        extra_headers: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
         body = None
         headers = {"Accept": "application/json"}
-        if payload is not None:
+        if extra_headers:
+            headers.update(extra_headers)
+        if raw_body is not None:
+            body = raw_body
+        elif payload is not None:
             body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
             headers["Content-Type"] = "application/json"
         request = urllib.request.Request(
@@ -96,7 +141,11 @@ class HubApiClient:
 
 
 class TextAgent:
-    """第一阶段的本地文字智能体，后续可替换为大模型意图解析器。"""
+    """旧版本地文字智能体，仅保留兼容测试和历史调用。
+
+    V1 生产链路不得使用此类直接把自然语言转换成硬件命令；桌面端和
+    随身设备必须通过 RK3588AgentClient 先规划、再确认、后执行。
+    """
 
     DEVICE_ID_PATTERN = re.compile(r"bean_ye_[0-9]+")
 

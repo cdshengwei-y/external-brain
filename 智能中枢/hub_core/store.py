@@ -97,12 +97,16 @@ class HubStore:
                     request_id TEXT PRIMARY KEY,
                     portable_device_id TEXT NOT NULL,
                     conversation_id TEXT NOT NULL,
+                    protocol_version TEXT NOT NULL DEFAULT '1.0',
+                    source TEXT NOT NULL DEFAULT 'portable',
                     input_type TEXT NOT NULL,
                     text TEXT,
+                    transcript TEXT,
                     media_id TEXT,
                     target_device_id TEXT,
                     state TEXT NOT NULL,
                     intent TEXT,
+                    plan_id TEXT,
                     command_id TEXT,
                     response_text TEXT,
                     result TEXT,
@@ -132,6 +136,24 @@ class HubStore:
                 CREATE INDEX IF NOT EXISTS idx_portable_media_device
                     ON portable_media(portable_device_id, created_at);
                 """
+            )
+            self._ensure_column("portable_requests", "plan_id", "TEXT")
+            self._ensure_column(
+                "portable_requests", "protocol_version", "TEXT NOT NULL DEFAULT '1.0'"
+            )
+            self._ensure_column(
+                "portable_requests", "source", "TEXT NOT NULL DEFAULT 'portable'"
+            )
+            self._ensure_column("portable_requests", "transcript", "TEXT")
+
+    def _ensure_column(self, table: str, column: str, definition: str) -> None:
+        columns = {
+            row[1]
+            for row in self._connection.execute(f"PRAGMA table_info({table})")
+        }
+        if column not in columns:
+            self._connection.execute(
+                f"ALTER TABLE {table} ADD COLUMN {column} {definition}"
             )
 
     def register_device(
@@ -234,6 +256,14 @@ class HubStore:
 
     def touch_device(self, device_id: str, status: str = "online") -> Optional[Dict[str, Any]]:
         return self.update_device_status(device_id, status)
+
+    def mark_all_devices_offline(self) -> int:
+        """Invalidate persisted online flags until MQTT confirms liveness again."""
+        with self._lock:
+            cursor = self._connection.execute(
+                "UPDATE devices SET status = 'offline' WHERE status = 'online'"
+            )
+            return cursor.rowcount
 
     def create_command(
         self,
@@ -391,23 +421,31 @@ class HubStore:
         text: Optional[str],
         media_id: Optional[str],
         target_device_id: Optional[str],
+        transcript: Optional[str] = None,
         state: str = "received",
+        protocol_version: str = "1.0",
+        source: str = "portable",
     ) -> Dict[str, Any]:
         now = utc_now()
         with self._lock:
             self._connection.execute(
                 """
                 INSERT INTO portable_requests (
-                    request_id, portable_device_id, conversation_id, input_type,
-                    text, media_id, target_device_id, state, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    request_id, portable_device_id, conversation_id, protocol_version,
+                    source, input_type,
+                    text, transcript, media_id, target_device_id, state, intent, plan_id,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)
                 """,
                 (
                     request_id,
                     portable_device_id,
                     conversation_id,
+                    protocol_version,
+                    source,
                     input_type,
                     text,
+                    transcript,
                     media_id,
                     target_device_id,
                     state,
@@ -430,6 +468,8 @@ class HubStore:
         request_id: str,
         state: Optional[str] = None,
         intent: Optional[Dict[str, Any]] = None,
+        transcript: Optional[str] = None,
+        plan_id: Optional[str] = None,
         command_id: Optional[str] = None,
         response_text: Optional[str] = None,
         result: Optional[Dict[str, Any]] = None,
@@ -442,6 +482,8 @@ class HubStore:
             return None
         next_state = state if state is not None else request["state"]
         next_intent = intent if intent is not None else request["intent"]
+        next_transcript = transcript if transcript is not None else request["transcript"]
+        next_plan_id = plan_id if plan_id is not None else request["plan_id"]
         next_command_id = command_id if command_id is not None else request["command_id"]
         next_response_text = (
             response_text if response_text is not None else request["response_text"]
@@ -456,7 +498,7 @@ class HubStore:
             self._connection.execute(
                 """
                 UPDATE portable_requests
-                SET state = ?, intent = ?, command_id = ?, response_text = ?,
+                SET state = ?, intent = ?, transcript = ?, plan_id = ?, command_id = ?, response_text = ?,
                     result = ?, error_code = ?, error_message = ?, retryable = ?,
                     updated_at = ?
                 WHERE request_id = ?
@@ -466,6 +508,8 @@ class HubStore:
                     json.dumps(next_intent, ensure_ascii=False)
                     if next_intent is not None
                     else None,
+                    next_transcript,
+                    next_plan_id,
                     next_command_id,
                     next_response_text,
                     json.dumps(next_result, ensure_ascii=False)
@@ -569,12 +613,16 @@ class HubStore:
             "request_id": row["request_id"],
             "portable_device_id": row["portable_device_id"],
             "conversation_id": row["conversation_id"],
+            "protocol_version": row["protocol_version"],
+            "source": row["source"],
             "input_type": row["input_type"],
             "text": row["text"],
+            "transcript": row["transcript"],
             "media_id": row["media_id"],
             "target_device_id": row["target_device_id"],
             "state": row["state"],
             "intent": _json_loads(row["intent"], None),
+            "plan_id": row["plan_id"],
             "command_id": row["command_id"],
             "response_text": row["response_text"],
             "result": _json_loads(row["result"], None),

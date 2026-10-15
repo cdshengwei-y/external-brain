@@ -55,7 +55,7 @@
 - 断线重连；
 - 命令执行结果和错误上报。
 
-录音音频传输暂不纳入第一阶段核心链路。
+随身设备音频入口已纳入当前链路验证：音频上传到中枢后调用录音豆项目共用的千问 ASR 服务，再把文字交给 RK3588 自动路由；这不代表录音豆本身已经完成音频采集或传输接入。
 
 ## 3. 系统结构
 
@@ -85,7 +85,9 @@ smart recording beam
 
 ## 4. 通信边界
 
-### 4.1 智能体到中枢
+### 4.1 HubService 内部命令 API
+
+下面这组接口是中枢内部能力命令接口。RK3588 和桌面上位机不得把自然语言直接转换后绕过规划确认调用它；它只能接收已经经过 V1 计划确认的结构化能力，或由随身设备执行适配层在确认后调用。
 
 智能体不直接操作 MQTT，而是调用中枢本地 API：
 
@@ -100,7 +102,15 @@ POST /api/v1/commands/{command_id}/cancel
 GET  /api/v1/events
 ```
 
-智能体负责理解自然语言和拆解任务；中枢负责能力校验、任务调度和执行状态管理。
+RK3588 负责统一自动路由、自然语言理解、快速路由和 `plan_id` 生成。自动路由必须先判断消息属于聊天、澄清还是硬件命令；聊天直接返回回复，只有用户确认硬件计划后，执行适配层才调用下方接口。中枢负责能力校验、任务调度和执行状态管理。
+
+V1 规划/执行入口为：
+
+```text
+POST /api/hub/v1/commands       # dispatch=false 只规划
+POST /api/hub/v1/commands       # dispatch=true 携带 plan_id 执行
+POST /api/hub/v1/commands/{request_id}/confirm
+```
 
 `GET /api/v1/devices/{device_id}/state` 返回设备最近一次通过 MQTT 上报的真实状态；如果设备还没有上报过状态，响应中的 `available` 为 `false`，不能把缺失状态当成设备正常。
 
@@ -299,17 +309,18 @@ python3 run.py \\
   --bridge-port 19700
 ```
 
-桥接接口为 `POST /command`，它接收 RK3588 硬件网关格式，并把 `command.action` 映射为现有中枢能力。桥接层会复用 `request_id` 作为本地 `command_id`，避免网络重试重复下发 MQTT 命令；只有收到真实设备 `succeeded` ack 才返回 `ok: true`。
+桥接接口为 `POST /command`，接收 V1 结构化硬件命令。新调用必须使用 `protocol_version`、`request_id`、`source`、`command.device_id`、`command.capability` 和 `command.params`；桥接层会复用 `request_id` 作为当前版本的本地 `command_id`，避免网络重试重复下发 MQTT 命令。只有收到真实设备 `succeeded` ack 才返回 `ok: true`。旧设备仍可在桥接边界使用 `command.action` 兼容别名，但不会进入中枢内部。
 
 ```bash
 curl -X POST http://127.0.0.1:19700/command \\
   -H 'Content-Type: application/json' \\
   -d '{
+    "protocol_version": "1.0",
     "request_id": "hub-20261010-0001",
     "source": "rk3588",
     "command": {
       "device_id": "bean_ye_1",
-      "action": "record.start",
+      "capability": "record.start",
       "params": {}
     }
   }'

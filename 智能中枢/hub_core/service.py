@@ -29,9 +29,14 @@ class HubService:
         self.transport = transport or MemoryTransport()
         self.event_bus = event_bus or EventBus()
         self._lock = threading.RLock()
+        self._pending_availability: Dict[str, str] = {}
 
     def health(self) -> Dict[str, Any]:
         return {"status": "ok", "service": "smart-hub"}
+
+    def mark_persisted_devices_offline(self) -> int:
+        """Clear stale online flags before the MQTT retained state is replayed."""
+        return self.store.mark_all_devices_offline()
 
     def register_device(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         device_id = self._required_string(payload, "device_id")
@@ -42,6 +47,9 @@ class HubService:
             isinstance(item, str) and item for item in capabilities
         ):
             raise ValidationError("capabilities 必须是非空字符串数组")
+        status = payload.get("status", "online")
+        if status not in {"online", "offline"}:
+            raise ValidationError("status 必须是 online 或 offline")
         device = self.store.register_device(
             device_id=device_id,
             device_type=device_type,
@@ -49,7 +57,7 @@ class HubService:
             firmware_version=payload.get("firmware_version"),
             capabilities=capabilities,
             metadata=payload.get("metadata") or {},
-            status="online",
+            status=status,
         )
         self._emit("device.registered", device_id, None, {"device": device})
         return device
@@ -92,7 +100,6 @@ class HubService:
     def ingest_state(self, device_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         self._ensure_device(device_id)
         self.store.upsert_device_state(device_id, payload)
-        self.store.touch_device(device_id)
         event = self._emit("device.state", device_id, None, payload)
         return event
 
@@ -269,10 +276,18 @@ class HubService:
         device_id = parts[-2]
         message_type = parts[-1]
         if message_type == "manifest":
-            self.register_device(payload)
+            existing = self.store.get_device(device_id)
+            manifest = dict(payload)
+            manifest["status"] = (
+                self._pending_availability.pop(device_id, None)
+                or (existing["status"] if existing is not None else "offline")
+            )
+            self.register_device(manifest)
         elif message_type == "availability":
             if self.store.get_device(device_id) is not None:
                 self.update_availability(device_id, payload)
+            elif payload.get("status") in {"online", "offline"}:
+                self._pending_availability[device_id] = payload["status"]
         elif message_type == "state":
             self.ingest_state(device_id, payload)
         elif message_type == "events":

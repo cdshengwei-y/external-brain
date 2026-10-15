@@ -39,6 +39,7 @@ def main() -> None:
     args = build_parser().parse_args()
     store = HubStore(args.db)
     service = HubService(store=store, transport=MemoryTransport())
+    service.mark_persisted_devices_offline()
     mqtt_transport = None
     if args.mqtt_host:
         mqtt_transport = PahoMqttTransport(

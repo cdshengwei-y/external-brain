@@ -13,6 +13,8 @@ from .service import HubService
 class HttpMqttBridge:
     """Translate RK3588 HTTP commands into the existing HubService/MQTT flow."""
 
+    PROTOCOL_VERSION = "1.0"
+
     def __init__(self, service: HubService, wait_timeout_seconds: float = 30.0):
         if wait_timeout_seconds < 0 or wait_timeout_seconds > 60:
             raise ValueError("wait_timeout_seconds 必须在 0 到 60 之间")
@@ -21,6 +23,9 @@ class HttpMqttBridge:
 
     def execute(self, payload: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
         request_id = self._required_string(payload, "request_id")
+        protocol_version = payload.get("protocol_version", self.PROTOCOL_VERSION)
+        if protocol_version != self.PROTOCOL_VERSION:
+            raise ValidationError("protocol_version 必须是 1.0")
         source = payload.get("source") or "rk3588"
         if not isinstance(source, str) or not source.strip():
             raise ValidationError("source 必须是非空字符串")
@@ -30,12 +35,14 @@ class HttpMqttBridge:
             raise ValidationError("command 必须是 JSON 对象")
 
         device_id = self._required_string(command_payload, "device_id")
-        action = command_payload.get("action")
-        if action is None:
-            action = command_payload.get("capability")
-        if not isinstance(action, str) or not action.strip():
-            raise ValidationError("command.action 必须是非空字符串")
-        action = action.strip()
+        if "action" in command_payload and "capability" in command_payload:
+            raise ValidationError("command 不能同时提供 action 和 capability")
+        capability = command_payload.get("capability")
+        if capability is None:
+            capability = command_payload.get("action")
+        if not isinstance(capability, str) or not capability.strip():
+            raise ValidationError("command.capability 必须是非空字符串")
+        capability = capability.strip()
 
         params = command_payload.get("params") or {}
         if not isinstance(params, dict):
@@ -49,7 +56,7 @@ class HttpMqttBridge:
         command = self._get_or_submit_command(
             request_id=request_id,
             device_id=device_id,
-            action=action,
+            capability=capability,
             params=params,
             policy=policy,
             conversation_id=conversation_id,
@@ -61,6 +68,7 @@ class HttpMqttBridge:
         return self._format_result(
             request_id=request_id,
             source=source.strip(),
+            protocol_version=protocol_version,
             command=final_command,
         )
 
@@ -68,7 +76,7 @@ class HttpMqttBridge:
         self,
         request_id: str,
         device_id: str,
-        action: str,
+        capability: str,
         params: Dict[str, Any],
         policy: str,
         conversation_id: str,
@@ -81,7 +89,7 @@ class HttpMqttBridge:
         if existing is not None:
             if (
                 existing["device_id"] != device_id
-                or existing["capability"] != action
+                or existing["capability"] != capability
                 or existing["params"] != params
             ):
                 raise ConflictError("request_id 已被其他命令使用")
@@ -96,7 +104,7 @@ class HttpMqttBridge:
             {
                 "command_id": request_id,
                 "conversation_id": conversation_id,
-                "capability": action,
+                "capability": capability,
                 "params": params,
                 "policy": policy,
             },
@@ -106,6 +114,7 @@ class HttpMqttBridge:
     def _format_result(
         request_id: str,
         source: str,
+        protocol_version: str,
         command: Dict[str, Any],
     ) -> Tuple[int, Dict[str, Any]]:
         state = command["state"]
@@ -114,11 +123,12 @@ class HttpMqttBridge:
             result = {}
         response: Dict[str, Any] = {
             "ok": state == "succeeded",
+            "protocol_version": protocol_version,
             "request_id": request_id,
             "source": source,
             "command_id": command["command_id"],
             "device_id": command["device_id"],
-            "action": command["capability"],
+            "capability": command["capability"],
             "state": state,
         }
 

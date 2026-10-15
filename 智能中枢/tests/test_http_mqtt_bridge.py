@@ -38,10 +38,11 @@ class HttpMqttBridgeTest(unittest.TestCase):
             response["value"] = bridge.execute(
                 {
                     "request_id": "hub-001",
+                    "protocol_version": "1.0",
                     "source": "rk3588",
                     "command": {
                         "device_id": "bean_ye_1",
-                        "action": "record.start",
+                        "capability": "record.start",
                         "params": {},
                     },
                 }
@@ -73,9 +74,10 @@ class HttpMqttBridgeTest(unittest.TestCase):
         status_code, body = bridge.execute(
             {
                 "request_id": "hub-002",
+                "protocol_version": "1.0",
                 "command": {
                     "device_id": "bean_ye_1",
-                    "action": "status.read",
+                    "capability": "status.read",
                     "params": {},
                 },
             }
@@ -90,9 +92,10 @@ class HttpMqttBridgeTest(unittest.TestCase):
         bridge = HttpMqttBridge(self.service, wait_timeout_seconds=0)
         payload = {
             "request_id": "hub-003",
+            "protocol_version": "1.0",
             "command": {
                 "device_id": "bean_ye_1",
-                "action": "record.stop",
+                "capability": "record.stop",
                 "params": {},
             },
         }
@@ -114,9 +117,10 @@ class HttpMqttBridgeTest(unittest.TestCase):
         bridge.execute(
             {
                 "request_id": "hub-004",
+                "protocol_version": "1.0",
                 "command": {
                     "device_id": "bean_ye_1",
-                    "action": "record.start",
+                    "capability": "record.start",
                     "params": {},
                 },
             }
@@ -126,15 +130,34 @@ class HttpMqttBridgeTest(unittest.TestCase):
             bridge.execute(
                 {
                     "request_id": "hub-004",
+                    "protocol_version": "1.0",
                     "command": {
                         "device_id": "bean_ye_1",
-                        "action": "record.stop",
+                        "capability": "record.stop",
                         "params": {},
                     },
                 }
             )
 
         self.assertIn("request_id 已被其他命令使用", str(context.exception))
+
+    def test_accepts_legacy_action_only_at_bridge_boundary(self):
+        bridge = HttpMqttBridge(self.service, wait_timeout_seconds=0)
+        status_code, body = bridge.execute(
+            {
+                "request_id": "hub-005",
+                "protocol_version": "1.0",
+                "command": {
+                    "device_id": "bean_ye_1",
+                    "action": "status.read",
+                    "params": {},
+                },
+            }
+        )
+
+        self.assertEqual(status_code, 202)
+        self.assertEqual(body["capability"], "status.read")
+        self.assertNotIn("action", body)
 
 
 if __name__ == "__main__":

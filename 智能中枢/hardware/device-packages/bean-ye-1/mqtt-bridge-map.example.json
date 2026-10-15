@@ -1,0 +1,104 @@
+{
+  "device_id": "bean_ye_1",
+  "deployment": {
+    "broker_url": "mqtt://<hub-host>:1883",
+    "username": "<MQTT_USERNAME>",
+    "password_env": "MQTT_PASSWORD",
+    "client_id": "smart-hub-bridge-bean_ye_1",
+    "tls": false,
+    "tls_ca_file": ""
+  },
+  "topics": {
+    "manifest": "hub/v1/devices/{device_id}/manifest",
+    "availability": "hub/v1/devices/{device_id}/availability",
+    "state": "hub/v1/devices/{device_id}/state",
+    "events": "hub/v1/devices/{device_id}/events",
+    "command": "hub/v1/devices/{device_id}/commands",
+    "ack": "hub/v1/devices/{device_id}/command-acks"
+  },
+  "mqtt_options": {
+    "command_qos": 1,
+    "ack_qos": 1,
+    "state_qos": 1,
+    "availability_qos": 1,
+    "retain_manifest": true,
+    "retain_state": true,
+    "retain_availability": true,
+    "retain_command": false
+  },
+  "command_envelope": {
+    "type_field": "type",
+    "type_value": "command",
+    "command_id_field": "command_id",
+    "conversation_id_field": "conversation_id",
+    "device_id_field": "device_id",
+    "capability_field": "capability",
+    "params_field": "params",
+    "issued_at_field": "issued_at"
+  },
+  "capability_mappings": [
+    {
+      "capability": "record.start",
+      "params_schema": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+      },
+      "publish_payload_template": {
+        "type": "command",
+        "command_id": "{command_id}",
+        "conversation_id": "{conversation_id}",
+        "device_id": "bean_ye_1",
+        "capability": "record.start",
+        "params": {},
+        "issued_at": "{issued_at}"
+      }
+    },
+    {
+      "capability": "record.stop",
+      "params_schema": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+      },
+      "publish_payload_template": {
+        "type": "command",
+        "command_id": "{command_id}",
+        "conversation_id": "{conversation_id}",
+        "device_id": "bean_ye_1",
+        "capability": "record.stop",
+        "params": {},
+        "issued_at": "{issued_at}"
+      }
+    },
+    {
+      "capability": "status.read",
+      "params_schema": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+      },
+      "publish_payload_template": {
+        "type": "command",
+        "command_id": "{command_id}",
+        "conversation_id": "{conversation_id}",
+        "device_id": "bean_ye_1",
+        "capability": "status.read",
+        "params": {},
+        "issued_at": "{issued_at}"
+      }
+    }
+  ],
+  "ack_rules": {
+    "command_id_field": "command_id",
+    "state_field": "state",
+    "success_values": ["succeeded"],
+    "running_values": ["running", "executing", "queued"],
+    "failure_values": ["failed", "timed_out"],
+    "require_matching_device_id": true
+  },
+  "timeouts": {
+    "ack_seconds": 30,
+    "state_seconds": 5
+  }
+}
