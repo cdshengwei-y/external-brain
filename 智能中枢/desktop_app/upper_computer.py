@@ -42,6 +42,7 @@ from desktop_app.jarvis_panel import JarvisPanel
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 HUB_URL = "http://127.0.0.1:18787"
+HUB_BIND_HOST = os.getenv("HUB_BIND_HOST", "0.0.0.0")
 BRIDGE_HEALTH_URL = "http://127.0.0.1:19700/health"
 BROKER_HOST = "127.0.0.1"
 BROKER_PORT = 1883
@@ -143,7 +144,7 @@ class HubRuntime:
                 sys.executable,
                 str(PROJECT_ROOT / "run.py"),
                 "--host",
-                "127.0.0.1",
+                HUB_BIND_HOST,
                 "--port",
                 "18787",
                 "--db",

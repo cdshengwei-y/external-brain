@@ -4,6 +4,8 @@
 
 #include "board_config.h"
 
+#if !defined(AUDIO_PROBE) && !defined(AUDIO_CAPTURE)
+
 namespace {
 
 unsigned long last_heartbeat_ms = 0;
@@ -113,3 +115,5 @@ void loop() {
   }
   delay(10);
 }
+
+#endif

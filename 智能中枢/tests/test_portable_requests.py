@@ -201,6 +201,22 @@ class PortableRequestServiceTest(unittest.TestCase):
         self.assertEqual(request["state"], "succeeded")
         self.assertEqual(request["command_id"], "command-001")
 
+    def test_successful_execution_does_not_reuse_planning_reply(self):
+        self.requests.submit(self._payload(text="开始录音"))
+        request = self._wait_for_state("request-001", "planned")
+        self.planner.dispatch_hub_command = lambda **kwargs: {
+            "ok": True,
+            "status": "succeeded",
+            "state": "succeeded",
+            "command_id": "command-002",
+            "reply": "准备对录音豆执行 record.start。",
+        }
+
+        self.requests.confirm("request-001", request["plan_id"])
+        request = self._wait_for_state("request-001", "succeeded")
+
+        self.assertEqual(request["response_text"], "已经开始录音。")
+
     def test_audio_upload_is_persisted_without_exposing_binary_data(self):
         media = self.requests.upload_media(
             portable_device_id="portable_001",

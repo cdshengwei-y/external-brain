@@ -343,7 +343,11 @@ class PortableRequestService:
                 request_id,
                 state=request_state,
                 command_id=response.get("command_id"),
-                response_text=self._response_message(response, "执行结果已返回。"),
+                response_text=self._execution_response_message(
+                    response,
+                    intent,
+                    request_state,
+                ),
                 result=response.get("result"),
                 error_code=("COMMAND_FAILED" if not success else None),
                 error_message=(
@@ -419,6 +423,31 @@ class PortableRequestService:
             if isinstance(value, str) and value.strip():
                 return value.strip()
         return fallback
+
+    @classmethod
+    def _execution_response_message(
+        cls,
+        response: Dict[str, Any],
+        intent: Dict[str, Any],
+        request_state: str,
+    ) -> str:
+        if request_state != "succeeded":
+            return cls._response_message(response, "执行结果已返回。")
+
+        for key in ("message", "content"):
+            value = response.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+
+        success_messages = {
+            "record.start": "已经开始录音。",
+            "record.stop": "已经停止录音。",
+            "status.read": "设备状态查询完成。",
+        }
+        capability = intent.get("capability")
+        if isinstance(capability, str) and capability in success_messages:
+            return success_messages[capability]
+        return "设备执行成功。"
 
     @staticmethod
     def _route_reply(response: Dict[str, Any], fallback: str) -> str:
