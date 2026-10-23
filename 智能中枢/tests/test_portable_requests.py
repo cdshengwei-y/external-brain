@@ -2,6 +2,8 @@ import tempfile
 import time
 import unittest
 import base64
+import io
+import wave
 
 from agent_gateway.portable import PortableRequestService
 from hub_core.service import HubService
@@ -67,6 +69,21 @@ class FakeTranscriptionProvider:
     def transcribe(self, audio_data_url):
         self.audio_data_urls.append(audio_data_url)
         return self.response
+
+
+class FakeSpeechProvider:
+    def __init__(self):
+        self.texts = []
+
+    def synthesize(self, text):
+        self.texts.append(text)
+        output = io.BytesIO()
+        with wave.open(output, "wb") as target:
+            target.setnchannels(1)
+            target.setsampwidth(2)
+            target.setframerate(16000)
+            target.writeframes(b"\x00\x00" * 160)
+        return output.getvalue(), "wav", "audio/wav"
 
 
 class FakeRouteProvider:
@@ -365,6 +382,111 @@ class PortableRequestServiceTest(unittest.TestCase):
             )
             self.assertEqual(request["error_code"], "AUDIO_TRANSCRIPTION_EMPTY")
             self.assertEqual(len(self.planner.plan_calls), 0)
+        finally:
+            requests.close()
+
+    def test_wake_request_returns_awake_session_action(self):
+        media = self.requests.upload_media(
+            portable_device_id="portable_001",
+            media_type="audio",
+            audio_format="wav",
+            content_type="audio/wav",
+            data=b"RIFF-test-audio",
+        )
+        requests = PortableRequestService(
+            self.hub,
+            self.planner,
+            transcription_provider=FakeTranscriptionProvider({"text": "贾维斯"}),
+        )
+        try:
+            requests.submit(
+                {
+                    **self._payload(request_id="wake-001"),
+                    "input_type": "audio",
+                    "session_mode": "wake",
+                    "text": None,
+                    "media_id": media["media_id"],
+                }
+            )
+            request = self._wait_for_state_with_service(requests, "wake-001", "completed")
+            self.assertEqual(request["session_action"], "awake")
+            self.assertEqual(request["response_text"], "我在")
+        finally:
+            requests.close()
+
+    def test_wake_request_accepts_common_asr_variants(self):
+        for index, transcript in enumerate(("贾文思", "假维基", "家维斯")):
+            self.assertTrue(
+                PortableRequestService._is_wake_phrase(transcript),
+                transcript,
+            )
+
+    def test_exit_phrase_returns_sleep_action_and_audio(self):
+        media = self.requests.upload_media(
+            portable_device_id="portable_001",
+            media_type="audio",
+            audio_format="wav",
+            content_type="audio/wav",
+            data=b"RIFF-test-audio",
+        )
+        speech = FakeSpeechProvider()
+        requests = PortableRequestService(
+            self.hub,
+            self.planner,
+            transcription_provider=FakeTranscriptionProvider({"text": "退下吧"}),
+            speech_provider=speech,
+        )
+        try:
+            requests.submit(
+                {
+                    **self._payload(request_id="sleep-001"),
+                    "input_type": "audio",
+                    "text": None,
+                    "media_id": media["media_id"],
+                }
+            )
+            request = self._wait_for_state_with_service(requests, "sleep-001", "completed")
+            self.assertEqual(request["session_action"], "sleep")
+            self.assertEqual(request["response_text"], "好的，我先待命。")
+            stored = self.store.get_portable_request("sleep-001")
+            self.assertTrue(stored["response_audio"])
+            self.assertEqual(speech.texts, ["好的，我先待命。"])
+        finally:
+            requests.close()
+
+    def test_wearable_command_auto_executes_without_confirmation(self):
+        media = self.requests.upload_media(
+            portable_device_id="portable_001",
+            media_type="audio",
+            audio_format="wav",
+            content_type="audio/wav",
+            data=b"RIFF-test-audio",
+        )
+        speech = FakeSpeechProvider()
+        requests = PortableRequestService(
+            self.hub,
+            self.planner,
+            transcription_provider=FakeTranscriptionProvider({"text": "开始录音"}),
+            speech_provider=speech,
+        )
+        try:
+            requests.submit(
+                {
+                    **self._payload(request_id="wearable-command-001"),
+                    "source": "wearable",
+                    "input_type": "audio",
+                    "text": None,
+                    "media_id": media["media_id"],
+                }
+            )
+            request = self._wait_for_state_with_service(
+                requests,
+                "wearable-command-001",
+                "succeeded",
+            )
+            self.assertEqual(request["state"], "succeeded")
+            self.assertEqual(request["response_text"], "已经开始录音。")
+            self.assertTrue(self.store.get_portable_request("wearable-command-001")["response_audio"])
         finally:
             requests.close()
 

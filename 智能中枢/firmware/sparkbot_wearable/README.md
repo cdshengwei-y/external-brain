@@ -139,3 +139,21 @@ cp include/wifi_config.example.h include/wifi_config.h
 
 重新编译、烧录后，在串口输入 `u`。串口会打印 Wi-Fi 地址、上传状态、请求状态、ASR 转写和 RK3588 返回结果。
 当前上传仍然只采集音频，不启用 NS4150B 功放。
+
+## 第一版语音会话
+
+`v` 命令会进入语音会话循环：待机时采集短语音片段并交给中枢检测“贾维斯”，命中后播放“我在”；随后自动采集每一轮语音，交给千问 ASR 和 RK3588 自动路由。聊天回复或真实硬件执行结果由中枢生成 16 kHz/16 bit/单声道 WAV，桌宠下载后播放。说“退下吧”会播放待命回复并回到待机。
+
+```text
+pio device monitor --port /dev/cu.usbmodem13101 --baud 115200
+v
+```
+
+当前第一版通过服务端 ASR 检测唤醒词，优先验证完整真实链路；它不是本地 WakeNet，待链路稳定后再替换成本地唤醒模型以降低待机网络请求和唤醒延迟。
+
+新增随身设备请求字段与接口：
+
+- `session_mode= wake`：只检测唤醒词，命中返回 `session_action=awake`；
+- `session_mode= conversation`：执行聊天或硬件命令，返回 `session_action=continue` 或 `sleep`；
+- `GET /api/v1/portable/v1/requests/{request_id}/audio`：下载中枢生成的 WAV 回复音频；
+- `source=wearable` 的硬件计划自动执行，仍必须经过 RK3588 结构化计划和真实设备 ACK。

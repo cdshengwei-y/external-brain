@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import base64
+import io
 import threading
 import uuid
+import wave
 from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional, Protocol
+from typing import Any, Dict, Optional, Protocol, Tuple
 
 from hub_core.errors import ConflictError, HubError, ValidationError
 from hub_core.service import HubService
@@ -13,6 +15,7 @@ from hub_core.service import HubService
 from .qwen_asr import QwenAsrClient
 from .rk3588 import RK3588AgentClient
 from .service import AgentGatewayError, TextAgent
+from .tts import RK3588TtsClient
 
 
 class HardwarePlanProvider(Protocol):
@@ -54,6 +57,25 @@ class MessageRouteProvider(Protocol):
         ...
 
 
+class SpeechSynthesisProvider(Protocol):
+    def synthesize(self, text: str) -> Tuple[bytes, str, str]:
+        ...
+
+
+class RK3588SpeechProvider:
+    def __init__(self, client: RK3588AgentClient) -> None:
+        self.client = RK3588TtsClient(client)
+
+    def synthesize(self, text: str) -> Tuple[bytes, str, str]:
+        audio_path = self.client.synthesize(text)
+        try:
+            audio = audio_path.read_bytes()
+        finally:
+            self.client.cleanup(audio_path)
+        normalized = _normalize_wav_for_wearable(audio)
+        return normalized, "wav", "audio/wav"
+
+
 class PortableAudioError(RuntimeError):
     def __init__(self, code: str, message: str, retryable: bool = False) -> None:
         super().__init__(message)
@@ -76,6 +98,7 @@ class PortableRequestService:
         plan_provider: Optional["HardwarePlanProvider"] = None,
         transcription_provider: Optional["AudioTranscriptionProvider"] = None,
         route_provider: Optional["MessageRouteProvider"] = None,
+        speech_provider: Optional["SpeechSynthesisProvider"] = None,
         max_workers: int = 4,
     ) -> None:
         self.hub = hub
@@ -84,6 +107,9 @@ class PortableRequestService:
             self.plan_provider = rk3588_client
             self.transcription_provider = transcription_provider or QwenAsrClient()
             self.route_provider = route_provider or rk3588_client
+            self.speech_provider = speech_provider or RK3588SpeechProvider(
+                rk3588_client
+            )
         else:
             self.plan_provider = plan_provider
             self.transcription_provider = transcription_provider
@@ -92,6 +118,7 @@ class PortableRequestService:
                 if callable(getattr(plan_provider, "route_message", None))
                 else None
             )
+            self.speech_provider = speech_provider
         self._lock = threading.RLock()
         self._executor = ThreadPoolExecutor(
             max_workers=max_workers,
@@ -161,6 +188,16 @@ class PortableRequestService:
             raise HubError(f"请求不存在: {request_id}", status_code=404)
         return self._public_request(request)
 
+    def get_audio(self, request_id: str) -> Tuple[bytes, str]:
+        request = self.hub.store.get_portable_request(request_id)
+        if request is None:
+            raise HubError(f"请求不存在: {request_id}", status_code=404)
+        audio = request.get("response_audio")
+        content_type = request.get("response_audio_content_type") or "audio/wav"
+        if not isinstance(audio, bytes) or not audio:
+            raise HubError("请求还没有可播放的回复音频", status_code=404)
+        return audio, str(content_type)
+
     def confirm(self, request_id: str, plan_id: str) -> Dict[str, Any]:
         request = self.hub.store.get_portable_request(request_id)
         if request is None:
@@ -203,12 +240,48 @@ class PortableRequestService:
                 text = self._transcribe_request(request_id, request)
             else:
                 text = request.get("text") or ""
-            self._update(request_id, state="understanding")
-            if TextAgent._is_list_devices_request(text):
+            session_mode = request.get("session_mode") or "conversation"
+            if session_mode == "wake":
+                if self._is_wake_phrase(text):
+                    self._update(
+                        request_id,
+                        state="completed",
+                        response_text="我在",
+                        session_action="awake",
+                    )
+                else:
+                    self._update(
+                        request_id,
+                        state="completed",
+                        response_text="",
+                        session_action="sleep",
+                    )
+                return
+            if self._is_exit_phrase(text):
+                response_text = "好的，我先待命。"
+                audio = self._synthesize(response_text)
                 self._update(
                     request_id,
                     state="completed",
-                    response_text=TextAgent._format_devices(self.hub.list_devices()),
+                    response_text=response_text,
+                    session_action="sleep",
+                    response_audio=audio[0] if audio else None,
+                    response_audio_format=audio[1] if audio else None,
+                    response_audio_content_type=audio[2] if audio else None,
+                )
+                return
+            self._update(request_id, state="understanding")
+            if TextAgent._is_list_devices_request(text):
+                response_text = TextAgent._format_devices(self.hub.list_devices())
+                audio = self._synthesize(response_text)
+                self._update(
+                    request_id,
+                    state="completed",
+                    response_text=response_text,
+                    session_action="continue",
+                    response_audio=audio[0] if audio else None,
+                    response_audio_format=audio[1] if audio else None,
+                    response_audio_content_type=audio[2] if audio else None,
                 )
                 return
             target_device_id = request.get("target_device_id")
@@ -218,25 +291,37 @@ class PortableRequestService:
                     conversation_id=request["conversation_id"],
                     input_text=text,
                     target_device_id=target_device_id,
-                    source="portable",
+                    source=request["source"],
                 )
                 route = str(response.get("route") or "").strip().lower()
                 if route in {"chat", "clarification", "assistant"}:
+                    response_text = self._route_reply(
+                        response,
+                        "我暂时没有可用的回复。",
+                    )
+                    audio = self._synthesize(response_text)
                     self._update(
                         request_id,
                         state="completed",
-                        response_text=self._route_reply(
-                            response,
-                            "我暂时没有可用的回复。",
-                        ),
+                        response_text=response_text,
+                        session_action="continue",
+                        response_audio=audio[0] if audio else None,
+                        response_audio_format=audio[1] if audio else None,
+                        response_audio_content_type=audio[2] if audio else None,
                     )
                     return
                 if not self._is_plan_response(response, route):
                     if self._route_reply(response, ""):
+                        response_text = self._route_reply(response, "")
+                        audio = self._synthesize(response_text)
                         self._update(
                             request_id,
                             state="completed",
-                            response_text=self._route_reply(response, ""),
+                            response_text=response_text,
+                            session_action="continue",
+                            response_audio=audio[0] if audio else None,
+                            response_audio_format=audio[1] if audio else None,
+                            response_audio_content_type=audio[2] if audio else None,
                         )
                         return
                     raise HubError(
@@ -273,16 +358,20 @@ class PortableRequestService:
                 "device_id": command.get("device_id") or device_id,
                 "params": command.get("params") or {},
             }
+            auto_execute = request["source"] == "wearable"
             self._update(
                 request_id,
-                state="planned",
+                state="confirming" if auto_execute else "planned",
                 intent=intent,
                 plan_id=plan_id,
                 response_text=self._response_message(
                     response,
                     "计划已生成，请确认执行。",
                 ),
+                session_action="continue",
             )
+            if auto_execute:
+                self._execute_planned_request(request_id)
         except (ValidationError, ConflictError) as error:
             self._update(
                 request_id,
@@ -339,15 +428,21 @@ class PortableRequestService:
             state = str(response.get("state") or response.get("status") or "")
             success = bool(response.get("ok")) or state == "succeeded"
             request_state = self._request_state_from_response(response, success)
+            response_text = self._execution_response_message(
+                response,
+                intent,
+                request_state,
+            )
+            audio = self._synthesize(response_text)
             self._update(
                 request_id,
                 state=request_state,
                 command_id=response.get("command_id"),
-                response_text=self._execution_response_message(
-                    response,
-                    intent,
-                    request_state,
-                ),
+                response_text=response_text,
+                session_action="continue",
+                response_audio=audio[0] if audio else None,
+                response_audio_format=audio[1] if audio else None,
+                response_audio_content_type=audio[2] if audio else None,
                 result=response.get("result"),
                 error_code=("COMMAND_FAILED" if not success else None),
                 error_message=(
@@ -585,6 +680,10 @@ class PortableRequestService:
             raise ValidationError("source 必须是非空字符串")
         values["protocol_version"] = "1.0"
         values["source"] = source.strip()
+        session_mode = payload.get("session_mode", "conversation")
+        if session_mode not in {"wake", "conversation"}:
+            raise ValidationError("session_mode 必须是 wake 或 conversation")
+        values["session_mode"] = session_mode
         text = payload.get("text")
         media_id = payload.get("media_id")
         if values["input_type"] == "text":
@@ -617,6 +716,7 @@ class PortableRequestService:
             "protocol_version",
             "source",
             "input_type",
+            "session_mode",
             "text",
             "media_id",
             "target_device_id",
@@ -629,8 +729,48 @@ class PortableRequestService:
         return {
             key: value
             for key, value in request.items()
-            if key not in {"media_id"}
+            if key not in {"media_id", "response_audio"}
         }
+
+    def _synthesize(self, text: str) -> Optional[Tuple[bytes, str, str]]:
+        if self.speech_provider is None or not text.strip():
+            return None
+        try:
+            return self.speech_provider.synthesize(text)
+        except Exception as error:
+            self.hub.event_bus.publish(
+                self.hub.store.add_event(
+                    event_type="portable.tts.failed",
+                    payload={"message": str(error)},
+                )
+            )
+            return None
+
+    @staticmethod
+    def _is_wake_phrase(text: str) -> bool:
+        normalized = "".join(str(text).lower().split())
+        aliases = (
+            "贾维斯",
+            "贾文思",
+            "假维基",
+            "假维斯",
+            "家维斯",
+            "加维斯",
+            "家卫斯",
+            "加卫斯",
+            "贾威斯",
+            "贾威思",
+            "贾维思",
+            "贾维",
+            "javis",
+            "jarvis",
+        )
+        return any(alias in normalized for alias in aliases)
+
+    @staticmethod
+    def _is_exit_phrase(text: str) -> bool:
+        normalized = "".join(str(text).lower().split())
+        return any(phrase in normalized for phrase in ("退下吧", "退下", "回到待机"))
 
     @staticmethod
     def _public_media(media: Dict[str, Any]) -> Dict[str, Any]:
@@ -639,3 +779,53 @@ class PortableRequestService:
             for key, value in media.items()
             if key != "data"
         }
+
+
+def _normalize_wav_for_wearable(audio: bytes) -> bytes:
+    try:
+        with wave.open(io.BytesIO(audio), "rb") as source:
+            channels = source.getnchannels()
+            sample_width = source.getsampwidth()
+            sample_rate = source.getframerate()
+            frames = source.readframes(source.getnframes())
+    except (wave.Error, EOFError) as error:
+        raise PortableAudioError(
+            "TTS_AUDIO_UNSUPPORTED",
+            "RK3588 TTS 必须返回 PCM WAV 音频。",
+        ) from error
+    if channels not in {1, 2} or sample_width != 2 or sample_rate <= 0:
+        raise PortableAudioError(
+            "TTS_AUDIO_UNSUPPORTED",
+            "RK3588 TTS 只支持 16 bit 单声道或双声道 WAV。",
+        )
+    import array
+
+    samples = array.array("h")
+    samples.frombytes(frames)
+    if channels == 2:
+        samples = array.array(
+            "h",
+            [
+                max(-32768, min(32767, (samples[index] + samples[index + 1]) // 2))
+                for index in range(0, len(samples) - 1, 2)
+            ],
+        )
+    if sample_rate != 16000 and samples:
+        target_count = max(1, round(len(samples) * 16000 / sample_rate))
+        source_count = len(samples)
+        resampled = array.array("h")
+        for index in range(target_count):
+            position = index * (source_count - 1) / max(1, target_count - 1)
+            left = int(position)
+            right = min(left + 1, source_count - 1)
+            fraction = position - left
+            value = round(samples[left] + (samples[right] - samples[left]) * fraction)
+            resampled.append(max(-32768, min(32767, value)))
+        samples = resampled
+    output = io.BytesIO()
+    with wave.open(output, "wb") as target:
+        target.setnchannels(1)
+        target.setsampwidth(2)
+        target.setframerate(16000)
+        target.writeframes(samples.tobytes())
+    return output.getvalue()

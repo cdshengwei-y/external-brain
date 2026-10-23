@@ -47,15 +47,28 @@ constexpr int kPowerAmpEnablePin = 46;
 constexpr uint32_t kSampleRate = 16000;
 constexpr uint32_t kMclkFrequency = kSampleRate * 256;
 constexpr size_t kCaptureBufferSamples = 2048;
-constexpr size_t kWavFrames = kSampleRate;
-constexpr size_t kWavBytes = 44 + kWavFrames * sizeof(int16_t);
+constexpr size_t kDefaultWavFrames = kSampleRate;
+constexpr size_t kMaxConversationFrames = kSampleRate * 8;
+constexpr size_t kMaxWavBytes = 44 + kMaxConversationFrames * sizeof(int16_t);
+constexpr size_t kVadChunkFrames = kCaptureBufferSamples / 2;
+constexpr size_t kVadSilenceChunks = 8;
+constexpr size_t kWakeVadSilenceChunks = 6;
+constexpr size_t kVadMinimumSpeechChunks = 2;
+constexpr uint32_t kVadThreshold = 350;
+constexpr uint32_t kWakeVadThreshold = 260;
+constexpr uint32_t kWakePollIntervalMs = 150;
+constexpr uint32_t kConversationPollIntervalMs = 500;
+constexpr int16_t kPlaybackVolumeDivisor = 2;
 
 bool i2c_started = false;
 bool i2s_started = false;
 
 int16_t capture_buffer[kCaptureBufferSamples];
-int16_t wav_mono_buffer[kWavFrames];
-uint8_t wav_file[kWavBytes];
+int16_t* wav_mono_buffer = nullptr;
+uint8_t* wav_file = nullptr;
+size_t wav_frames = 0;
+size_t wav_bytes = 0;
+String last_session_action;
 
 void start_i2c() {
   if (i2c_started) {
@@ -459,7 +472,12 @@ void write_little_endian32(uint8_t* output, uint32_t value) {
   output[3] = static_cast<uint8_t>((value >> 24) & 0xFF);
 }
 
-bool capture_mono_samples() {
+bool capture_mono_samples(size_t requested_frames = kDefaultWavFrames) {
+  if (wav_mono_buffer == nullptr || wav_file == nullptr ||
+      requested_frames == 0 || requested_frames > kMaxConversationFrames) {
+    Serial.println("[WAV] audio buffers are not ready");
+    return false;
+  }
   if (!start_i2s(I2S_MODE_RX)) {
     return false;
   }
@@ -471,7 +489,7 @@ bool capture_mono_samples() {
 
   delay(100);
   size_t captured_frames = 0;
-  while (captured_frames < kWavFrames) {
+  while (captured_frames < requested_frames) {
     size_t bytes_read = 0;
     const esp_err_t read_error = i2s_read(kI2sPort,
                                           capture_buffer,
@@ -487,13 +505,112 @@ bool capture_mono_samples() {
     }
 
     const size_t frames_read = bytes_read / (sizeof(int16_t) * 2);
-    const size_t frames_to_copy = min(frames_read, kWavFrames - captured_frames);
+    const size_t frames_to_copy = min(frames_read, requested_frames - captured_frames);
     for (size_t frame = 0; frame < frames_to_copy; ++frame) {
       wav_mono_buffer[captured_frames + frame] = capture_buffer[frame * 2];
     }
     captured_frames += frames_to_copy;
   }
   stop_i2s();
+  wav_frames = captured_frames;
+  return true;
+}
+
+bool capture_until_silence(
+    uint32_t max_seconds,
+    size_t required_silence_chunks = kVadSilenceChunks,
+    uint32_t vad_threshold = kVadThreshold) {
+  if (wav_mono_buffer == nullptr || wav_file == nullptr) {
+    Serial.println("[VAD] audio buffers are not ready");
+    return false;
+  }
+  if (!start_i2s(I2S_MODE_RX)) {
+    return false;
+  }
+  if (!configure_codec_for_adc()) {
+    Serial.println("[VAD] ES8311 configuration failed; stopping I2S");
+    stop_i2s();
+    return false;
+  }
+
+  delay(100);
+  const size_t max_frames = min(
+      static_cast<size_t>(kMaxConversationFrames),
+      static_cast<size_t>(max_seconds) * static_cast<size_t>(kSampleRate));
+  size_t captured_frames = 0;
+  size_t silence_chunks = 0;
+  size_t speech_chunks = 0;
+  size_t startup_chunks = 0;
+  bool speech_started = false;
+  while (captured_frames + kVadChunkFrames <= max_frames) {
+    size_t bytes_read = 0;
+    const esp_err_t read_error = i2s_read(
+        kI2sPort,
+        capture_buffer,
+        sizeof(capture_buffer),
+        &bytes_read,
+        pdMS_TO_TICKS(1000));
+    if (read_error != ESP_OK || bytes_read < sizeof(int16_t) * 2) {
+      Serial.printf("[VAD] capture failed: error=%s bytes=%u\n",
+                    esp_err_to_name(read_error),
+                    static_cast<unsigned int>(bytes_read));
+      stop_i2s();
+      return false;
+    }
+
+    const size_t frames_read = min(
+        bytes_read / (sizeof(int16_t) * 2),
+        kVadChunkFrames);
+    int32_t minimum = 32767;
+    int32_t maximum = -32768;
+    int64_t sum = 0;
+    for (size_t frame = 0; frame < frames_read; ++frame) {
+      const int16_t sample = capture_buffer[frame * 2];
+      minimum = min(minimum, static_cast<int32_t>(sample));
+      maximum = max(maximum, static_cast<int32_t>(sample));
+      sum += sample;
+    }
+    const int32_t mean = frames_read == 0
+                             ? 0
+                             : static_cast<int32_t>(sum / frames_read);
+    uint32_t peak = 0;
+    for (size_t frame = 0; frame < frames_read; ++frame) {
+      const int32_t centered = capture_buffer[frame * 2] - mean;
+      peak = max(peak, static_cast<uint32_t>(abs(centered)));
+      wav_mono_buffer[captured_frames + frame] = capture_buffer[frame * 2];
+    }
+    captured_frames += frames_read;
+
+    // ES8311 produces a short settling transient after each start. Do not
+    // treat that transient as speech, otherwise standby uploads noise clips.
+    const bool active = startup_chunks >= 5 && peak >= vad_threshold;
+    ++startup_chunks;
+    if (active) {
+      speech_started = true;
+      ++speech_chunks;
+      silence_chunks = 0;
+    } else if (speech_started) {
+      ++silence_chunks;
+    }
+    Serial.printf("[VAD] peak=%lu active=%s captured_ms=%lu\n",
+                  static_cast<unsigned long>(peak),
+                  active ? "yes" : "no",
+                  static_cast<unsigned long>(captured_frames * 1000 / kSampleRate));
+
+    if (speech_started && speech_chunks >= kVadMinimumSpeechChunks &&
+        silence_chunks >= required_silence_chunks) {
+      break;
+    }
+  }
+  stop_i2s();
+  wav_frames = captured_frames;
+  if (!speech_started || speech_chunks < kVadMinimumSpeechChunks) {
+    Serial.println("[VAD] no speech detected");
+    return false;
+  }
+  Serial.printf("[VAD] utterance captured: frames=%u seconds=%.2f\n",
+                static_cast<unsigned int>(wav_frames),
+                static_cast<double>(wav_frames) / kSampleRate);
   return true;
 }
 
@@ -522,7 +639,7 @@ void play_wakeup_audio() {
         _tmp_sparkbot_wozai_20261016_pcm_len / sizeof(int16_t) - offset;
     const size_t samples = min(remaining, kMonoChunkSamples);
     for (size_t index = 0; index < samples; ++index) {
-      mono_buffer[index] = pcm_samples[offset + index];
+      mono_buffer[index] = pcm_samples[offset + index] / kPlaybackVolumeDivisor;
     }
 
     size_t bytes_written = 0;
@@ -610,11 +727,12 @@ void play_test_tone() {
 void build_wav_file() {
   constexpr uint16_t kChannels = 1;
   constexpr uint16_t kBitsPerSample = 16;
-  constexpr uint32_t kDataBytes = static_cast<uint32_t>(kWavFrames * sizeof(int16_t));
+  const uint32_t kDataBytes = static_cast<uint32_t>(wav_frames * sizeof(int16_t));
+  wav_bytes = 44 + kDataBytes;
   uint8_t* header = wav_file;
-  memset(wav_file, 0, sizeof(wav_file));
+  memset(wav_file, 0, wav_bytes);
   memcpy(header + 0, "RIFF", 4);
-  write_little_endian32(header + 4, kWavBytes - 8);
+  write_little_endian32(header + 4, wav_bytes - 8);
   memcpy(header + 8, "WAVEfmt ", 8);
   write_little_endian32(header + 16, 16);
   write_little_endian16(header + 20, 1);
@@ -635,9 +753,9 @@ void capture_wav() {
   build_wav_file();
 
   Serial.printf("WAV_BEGIN bytes=%lu rate=%lu channels=1 bits=16\n",
-                static_cast<unsigned long>(kWavBytes),
+                static_cast<unsigned long>(wav_bytes),
                 static_cast<unsigned long>(kSampleRate));
-  Serial.write(wav_file, kWavBytes);
+  Serial.write(wav_file, wav_bytes);
   Serial.flush();
   Serial.println();
   Serial.println("WAV_END");
@@ -650,6 +768,11 @@ bool connect_wifi_for_upload() {
   }
 
   WiFi.mode(WIFI_STA);
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.printf("[WIFI] reusing connection, ip=%s\n",
+                  WiFi.localIP().toString().c_str());
+    return true;
+  }
   WiFi.begin(SPARKBOT_WIFI_SSID, SPARKBOT_WIFI_PASSWORD);
   Serial.printf("[WIFI] connecting to %s", SPARKBOT_WIFI_SSID);
   const unsigned long deadline = millis() + 15000;
@@ -684,8 +807,8 @@ bool post_audio_to_hub(String& media_id) {
   http.addHeader("X-Portable-Device-Id", SPARKBOT_DEVICE_ID);
   http.addHeader("X-Media-Type", "audio");
   http.addHeader("X-Audio-Format", "wav");
-  Serial.printf("[HUB] POST %s bytes=%u\n", url.c_str(), static_cast<unsigned int>(kWavBytes));
-  const int response_code = http.POST(wav_file, kWavBytes);
+  Serial.printf("[HUB] POST %s bytes=%u\n", url.c_str(), static_cast<unsigned int>(wav_bytes));
+  const int response_code = http.POST(wav_file, wav_bytes);
   const String response = http.getString();
   http.end();
   if (response_code < 200 || response_code >= 300) {
@@ -709,7 +832,10 @@ bool post_audio_to_hub(String& media_id) {
   return true;
 }
 
-bool submit_audio_request(const String& media_id, String& request_id) {
+bool submit_audio_request(
+    const String& media_id,
+    const char* session_mode,
+    String& request_id) {
   request_id = String("wearable-") + String(millis());
   const String conversation_id = String("wearable-") + String(SPARKBOT_DEVICE_ID);
   String body;
@@ -720,7 +846,9 @@ bool submit_audio_request(const String& media_id, String& request_id) {
   body += conversation_id;
   body += "\",\"request_id\":\"";
   body += request_id;
-  body += "\",\"protocol_version\":\"1.0\",\"source\":\"wearable\",\"input_type\":\"audio\",\"media_id\":\"";
+  body += "\",\"protocol_version\":\"1.0\",\"source\":\"wearable\",\"session_mode\":\"";
+  body += session_mode;
+  body += "\",\"input_type\":\"audio\",\"media_id\":\"";
   body += media_id;
   body += "\"}";
 
@@ -740,7 +868,127 @@ bool submit_audio_request(const String& media_id, String& request_id) {
   return response_code >= 200 && response_code < 300;
 }
 
-void wait_for_audio_request(const String& request_id) {
+bool read_stream_exact(Stream* stream, uint8_t* buffer, size_t length) {
+  size_t received = 0;
+  while (received < length) {
+    const size_t count = stream->readBytes(
+        reinterpret_cast<char*>(buffer + received), length - received);
+    if (count == 0) {
+      return false;
+    }
+    received += count;
+  }
+  return true;
+}
+
+uint32_t read_little_endian32(const uint8_t* input) {
+  return static_cast<uint32_t>(input[0]) |
+         (static_cast<uint32_t>(input[1]) << 8) |
+         (static_cast<uint32_t>(input[2]) << 16) |
+         (static_cast<uint32_t>(input[3]) << 24);
+}
+
+uint16_t read_little_endian16(const uint8_t* input) {
+  return static_cast<uint16_t>(input[0]) |
+         (static_cast<uint16_t>(input[1]) << 8);
+}
+
+bool play_response_audio(const String& request_id) {
+  if (!start_i2s(I2S_MODE_TX)) {
+    return false;
+  }
+
+  WiFiClient client;
+  HTTPClient http;
+  const String url = String(SPARKBOT_HUB_BASE_URL) +
+                     "/api/v1/portable/v1/requests/" + request_id + "/audio";
+  if (!http.begin(client, url)) {
+    Serial.println("[AUDIO] response audio client initialization failed");
+    stop_i2s();
+    return false;
+  }
+  http.setTimeout(30000);
+  const int response_code = http.GET();
+  if (response_code != 200) {
+    Serial.printf("[AUDIO] response audio unavailable: HTTP %d\n", response_code);
+    http.end();
+    stop_i2s();
+    return false;
+  }
+
+  Stream* stream = http.getStreamPtr();
+  uint8_t wav_header[44] = {};
+  if (!read_stream_exact(stream, wav_header, sizeof(wav_header)) ||
+      memcmp(wav_header, "RIFF", 4) != 0 ||
+      memcmp(wav_header + 8, "WAVE", 4) != 0 ||
+      memcmp(wav_header + 36, "data", 4) != 0) {
+    Serial.println("[AUDIO] response is not a PCM WAV file");
+    http.end();
+    stop_i2s();
+    return false;
+  }
+
+  const uint16_t channels = read_little_endian16(wav_header + 22);
+  const uint32_t sample_rate = read_little_endian32(wav_header + 24);
+  const uint16_t bits_per_sample = read_little_endian16(wav_header + 34);
+  uint32_t remaining = read_little_endian32(wav_header + 40);
+  if (channels != 1 || sample_rate != kSampleRate || bits_per_sample != 16 ||
+      remaining == 0) {
+    Serial.printf("[AUDIO] unsupported response format: rate=%lu channels=%u bits=%u\n",
+                  static_cast<unsigned long>(sample_rate),
+                  static_cast<unsigned int>(channels),
+                  static_cast<unsigned int>(bits_per_sample));
+    http.end();
+    stop_i2s();
+    return false;
+  }
+
+  if (!configure_codec_for_playback()) {
+    Serial.println("[AUDIO] ES8311 response playback configuration failed");
+    http.end();
+    stop_i2s();
+    return false;
+  }
+
+  digitalWrite(kPowerAmpEnablePin, HIGH);
+  delay(20);
+  uint8_t pcm_buffer[512];
+  bool success = true;
+  while (remaining > 0) {
+    const size_t requested = min(static_cast<uint32_t>(sizeof(pcm_buffer)), remaining);
+    if (!read_stream_exact(stream, pcm_buffer, requested)) {
+      success = false;
+      break;
+    }
+    int16_t* pcm_samples = reinterpret_cast<int16_t*>(pcm_buffer);
+    for (size_t index = 0; index < requested / sizeof(int16_t); ++index) {
+      pcm_samples[index] /= kPlaybackVolumeDivisor;
+    }
+    size_t bytes_written = 0;
+    const esp_err_t write_error = i2s_write(
+        kI2sPort, pcm_buffer, requested, &bytes_written, pdMS_TO_TICKS(1000));
+    if (write_error != ESP_OK || bytes_written != requested) {
+      Serial.printf("[AUDIO] response playback failed: error=%s bytes=%u\n",
+                    esp_err_to_name(write_error),
+                    static_cast<unsigned int>(bytes_written));
+      success = false;
+      break;
+    }
+    remaining -= requested;
+  }
+
+  i2s_zero_dma_buffer(kI2sPort);
+  delay(30);
+  digitalWrite(kPowerAmpEnablePin, LOW);
+  http.end();
+  stop_i2s();
+  Serial.printf("[AUDIO] response playback %s\n", success ? "completed" : "failed");
+  return success;
+}
+
+void wait_for_audio_request(
+    const String& request_id,
+    uint32_t poll_interval_ms = kConversationPollIntervalMs) {
   const String url = String(SPARKBOT_HUB_BASE_URL) +
                      "/api/v1/portable/v1/requests/" + request_id;
   const unsigned long deadline = millis() + 45000;
@@ -768,6 +1016,9 @@ void wait_for_audio_request(const String& request_id) {
       return;
     }
     const String state = document["state"].as<String>();
+    const String session_action = document["session_action"].as<String>();
+    const String session_mode = document["session_mode"].as<String>();
+    last_session_action = session_action;
     Serial.printf("[HUB] request state=%s", state.c_str());
     const char* transcript = document["transcript"] | "";
     const char* response_text = document["response_text"] | "";
@@ -779,34 +1030,84 @@ void wait_for_audio_request(const String& request_id) {
     }
     Serial.println();
 
-    if (state == "completed" || state == "failed" || state == "planned") {
+    if (state == "completed" || state == "succeeded" || state == "failed" ||
+        state == "planned") {
+      if ((state == "completed" || state == "succeeded") &&
+          session_action == "awake") {
+        play_wakeup_audio();
+      } else if ((state == "completed" || state == "succeeded") &&
+                 (session_action == "continue" ||
+                  (session_action == "sleep" && session_mode == "conversation"))) {
+        play_response_audio(request_id);
+      }
       if (state == "planned") {
         Serial.println("[HUB] hardware plan awaits confirmation; no command was executed");
       }
       return;
     }
-    delay(1000);
+    delay(poll_interval_ms);
   }
   Serial.println("[HUB] request status polling timed out");
 }
 
-void upload_wav_to_hub() {
-  if (!capture_mono_samples()) {
-    return;
-  }
+bool submit_captured_wav_to_hub(
+    const char* session_mode,
+    uint32_t poll_interval_ms = kConversationPollIntervalMs) {
   build_wav_file();
   if (!connect_wifi_for_upload()) {
-    return;
+    return false;
   }
 
   String media_id;
   if (!post_audio_to_hub(media_id)) {
-    return;
+    return false;
   }
   String request_id;
-  if (submit_audio_request(media_id, request_id)) {
+  if (submit_audio_request(media_id, session_mode, request_id)) {
     Serial.printf("[HUB] audio request accepted: request_id=%s\n", request_id.c_str());
-    wait_for_audio_request(request_id);
+    wait_for_audio_request(request_id, poll_interval_ms);
+    return true;
+  }
+  return false;
+}
+
+void upload_wav_to_hub(const char* session_mode = "conversation") {
+  if (wav_mono_buffer == nullptr || !capture_mono_samples()) {
+    return;
+  }
+  submit_captured_wav_to_hub(session_mode);
+}
+
+void run_voice_conversation() {
+  Serial.println("[VOICE] waiting for 贾维斯; first version uses server-side ASR wake detection");
+  while (true) {
+    last_session_action = "";
+    if (!capture_until_silence(3, kWakeVadSilenceChunks, kWakeVadThreshold)) {
+      continue;
+    }
+    if (!submit_captured_wav_to_hub("wake", kWakePollIntervalMs)) {
+      Serial.println("[VOICE] wake request failed; returning to standby");
+      return;
+    }
+    if (last_session_action == "awake") {
+      break;
+    }
+  }
+
+  Serial.println("[VOICE] awake; speak naturally, say 退下吧 to return to standby");
+  while (true) {
+    last_session_action = "";
+    if (!capture_until_silence(8)) {
+      continue;
+    }
+    if (!submit_captured_wav_to_hub("conversation")) {
+      Serial.println("[VOICE] conversation request failed; returning to standby");
+      return;
+    }
+    if (last_session_action == "sleep") {
+      Serial.println("[VOICE] returned to standby");
+      return;
+    }
   }
 }
 
@@ -814,6 +1115,8 @@ void print_help() {
   Serial.println("[CMD] a = initialize ES8311 and capture a short microphone sample");
   Serial.println("[CMD] w = capture 1 second mono WAV over USB (功放保持关闭)");
   Serial.println("[CMD] u = capture WAV and upload it to the hub over Wi-Fi");
+  Serial.println("[CMD] k = upload a short clip for server-side wake-word detection");
+  Serial.println("[CMD] v = start voice conversation loop");
   Serial.println("[CMD] p = play fixed wake response 我在！");
   Serial.println("[CMD] t = play a 3-second 1kHz hardware test tone");
   Serial.println("[CMD] s = scan I2C bus");
@@ -843,6 +1146,10 @@ void handle_commands() {
       capture_wav();
     } else if (command == 'u' || command == 'U') {
       upload_wav_to_hub();
+    } else if (command == 'k' || command == 'K') {
+      upload_wav_to_hub("wake");
+    } else if (command == 'v' || command == 'V') {
+      run_voice_conversation();
     } else if (command == 'p' || command == 'P') {
       play_wakeup_audio();
     } else if (command == 't' || command == 'T') {
@@ -861,6 +1168,9 @@ void setup() {
   Serial.begin(kSerialBaudRate);
   pinMode(kPowerAmpEnablePin, OUTPUT);
   digitalWrite(kPowerAmpEnablePin, LOW);
+  wav_mono_buffer = static_cast<int16_t*>(ps_malloc(
+      kMaxConversationFrames * sizeof(int16_t)));
+  wav_file = static_cast<uint8_t*>(ps_malloc(kMaxWavBytes));
   delay(1200);
   Serial.println();
   Serial.println("========================================");
@@ -868,6 +1178,10 @@ void setup() {
   Serial.println(" SAFE MODE: playback is manual-only with command p; PA GPIO46 defaults off");
   Serial.println("========================================");
   print_help();
+  if (wav_mono_buffer == nullptr || wav_file == nullptr) {
+    Serial.println("[WAV] PSRAM allocation failed; audio upload disabled");
+  }
+  connect_wifi_for_upload();
   scan_i2c();
 }
 

@@ -100,6 +100,7 @@ class HubStore:
                     protocol_version TEXT NOT NULL DEFAULT '1.0',
                     source TEXT NOT NULL DEFAULT 'portable',
                     input_type TEXT NOT NULL,
+                    session_mode TEXT NOT NULL DEFAULT 'conversation',
                     text TEXT,
                     transcript TEXT,
                     media_id TEXT,
@@ -109,6 +110,10 @@ class HubStore:
                     plan_id TEXT,
                     command_id TEXT,
                     response_text TEXT,
+                    session_action TEXT,
+                    response_audio BLOB,
+                    response_audio_format TEXT,
+                    response_audio_content_type TEXT,
                     result TEXT,
                     error_code TEXT,
                     error_message TEXT,
@@ -145,6 +150,19 @@ class HubStore:
                 "portable_requests", "source", "TEXT NOT NULL DEFAULT 'portable'"
             )
             self._ensure_column("portable_requests", "transcript", "TEXT")
+            self._ensure_column(
+                "portable_requests",
+                "session_mode",
+                "TEXT NOT NULL DEFAULT 'conversation'",
+            )
+            self._ensure_column("portable_requests", "session_action", "TEXT")
+            self._ensure_column("portable_requests", "response_audio", "BLOB")
+            self._ensure_column(
+                "portable_requests", "response_audio_format", "TEXT"
+            )
+            self._ensure_column(
+                "portable_requests", "response_audio_content_type", "TEXT"
+            )
 
     def _ensure_column(self, table: str, column: str, definition: str) -> None:
         columns = {
@@ -418,6 +436,7 @@ class HubStore:
         portable_device_id: str,
         conversation_id: str,
         input_type: str,
+        session_mode: str,
         text: Optional[str],
         media_id: Optional[str],
         target_device_id: Optional[str],
@@ -432,10 +451,10 @@ class HubStore:
                 """
                 INSERT INTO portable_requests (
                     request_id, portable_device_id, conversation_id, protocol_version,
-                    source, input_type,
+                    source, input_type, session_mode,
                     text, transcript, media_id, target_device_id, state, intent, plan_id,
                     created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)
                 """,
                 (
                     request_id,
@@ -444,6 +463,7 @@ class HubStore:
                     protocol_version,
                     source,
                     input_type,
+                    session_mode,
                     text,
                     transcript,
                     media_id,
@@ -472,6 +492,10 @@ class HubStore:
         plan_id: Optional[str] = None,
         command_id: Optional[str] = None,
         response_text: Optional[str] = None,
+        session_action: Optional[str] = None,
+        response_audio: Optional[bytes] = None,
+        response_audio_format: Optional[str] = None,
+        response_audio_content_type: Optional[str] = None,
         result: Optional[Dict[str, Any]] = None,
         error_code: Optional[str] = None,
         error_message: Optional[str] = None,
@@ -488,6 +512,26 @@ class HubStore:
         next_response_text = (
             response_text if response_text is not None else request["response_text"]
         )
+        next_session_action = (
+            session_action
+            if session_action is not None
+            else request["session_action"]
+        )
+        next_response_audio = (
+            response_audio
+            if response_audio is not None
+            else request["response_audio"]
+        )
+        next_response_audio_format = (
+            response_audio_format
+            if response_audio_format is not None
+            else request["response_audio_format"]
+        )
+        next_response_audio_content_type = (
+            response_audio_content_type
+            if response_audio_content_type is not None
+            else request["response_audio_content_type"]
+        )
         next_result = result if result is not None else request["result"]
         next_error_code = error_code if error_code is not None else request["error_code"]
         next_error_message = (
@@ -499,7 +543,8 @@ class HubStore:
                 """
                 UPDATE portable_requests
                 SET state = ?, intent = ?, transcript = ?, plan_id = ?, command_id = ?, response_text = ?,
-                    result = ?, error_code = ?, error_message = ?, retryable = ?,
+                    session_action = ?, response_audio = ?, response_audio_format = ?,
+                    response_audio_content_type = ?, result = ?, error_code = ?, error_message = ?, retryable = ?,
                     updated_at = ?
                 WHERE request_id = ?
                 """,
@@ -512,6 +557,12 @@ class HubStore:
                     next_plan_id,
                     next_command_id,
                     next_response_text,
+                    next_session_action,
+                    sqlite3.Binary(next_response_audio)
+                    if next_response_audio is not None
+                    else None,
+                    next_response_audio_format,
+                    next_response_audio_content_type,
                     json.dumps(next_result, ensure_ascii=False)
                     if next_result is not None
                     else None,
@@ -616,6 +667,7 @@ class HubStore:
             "protocol_version": row["protocol_version"],
             "source": row["source"],
             "input_type": row["input_type"],
+            "session_mode": row["session_mode"],
             "text": row["text"],
             "transcript": row["transcript"],
             "media_id": row["media_id"],
@@ -625,6 +677,14 @@ class HubStore:
             "plan_id": row["plan_id"],
             "command_id": row["command_id"],
             "response_text": row["response_text"],
+            "session_action": row["session_action"],
+            "response_audio": (
+                bytes(row["response_audio"])
+                if row["response_audio"] is not None
+                else None
+            ),
+            "response_audio_format": row["response_audio_format"],
+            "response_audio_content_type": row["response_audio_content_type"],
             "result": _json_loads(row["result"], None),
             "error_code": row["error_code"],
             "error_message": row["error_message"],
