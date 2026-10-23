@@ -292,15 +292,22 @@ class HubService:
             self.ingest_state(device_id, payload)
         elif message_type == "events":
             self.ingest_device_event(device_id, payload)
-        elif message_type == "command-acks":
+        elif message_type in {"acks", "command-acks"}:
             command_id = payload.get("command_id")
             if not command_id:
-                raise ValidationError("command-acks 缺少 command_id")
+                raise ValidationError("acks 缺少 command_id")
+            if payload.get("protocol_version") not in {None, "1.0"}:
+                raise ValidationError("acks protocol_version 必须是 1.0")
+            if payload.get("device_id") not in {None, device_id}:
+                raise ValidationError("acks device_id 与 topic 不匹配")
+            if "status" in payload and "state" not in payload:
+                payload = {**payload, "state": payload["status"]}
             self.acknowledge_command(device_id, command_id, payload)
 
     def _dispatch(self, command: Dict[str, Any]) -> None:
         envelope = {
             "type": "command",
+            "protocol_version": "1.0",
             "command_id": command["command_id"],
             "conversation_id": command["conversation_id"],
             "device_id": command["device_id"],

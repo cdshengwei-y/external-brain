@@ -29,6 +29,11 @@ class HubRequestHandler(BaseHTTPRequestHandler):
             if parsed.path == "/api/v1/health":
                 self._send_json(200, self.service.health())
                 return
+            if parsed.path.startswith("/api/v1/portable/v1/requests/") and parsed.path.endswith("/audio"):
+                request_id = parsed.path.rstrip("/").split("/")[-2]
+                audio, content_type = self.portable_service.get_audio(request_id)
+                self._send_binary(200, audio, content_type)
+                return
             if parsed.path.startswith("/api/v1/portable/v1/requests/"):
                 request_id = parsed.path.rstrip("/").split("/")[-1]
                 self._send_json(200, self.portable_service.get(request_id))
@@ -151,10 +156,16 @@ class HubRequestHandler(BaseHTTPRequestHandler):
             self._send_json(202, self.service.ingest_state(device_id, payload))
         elif action == "events":
             self._send_json(202, self.service.ingest_device_event(device_id, payload))
-        elif action == "command-acks":
+        elif action in {"acks", "command-acks"}:
             command_id = payload.get("command_id")
             if not command_id:
-                raise ValidationError("command-acks 缺少 command_id")
+                raise ValidationError("acks 缺少 command_id")
+            if payload.get("protocol_version") not in {None, "1.0"}:
+                raise ValidationError("acks protocol_version 必须是 1.0")
+            if payload.get("device_id") not in {None, device_id}:
+                raise ValidationError("acks device_id 与 topic 不匹配")
+            if "status" in payload and "state" not in payload:
+                payload = {**payload, "state": payload["status"]}
             self._send_json(
                 200,
                 self.service.acknowledge_command(device_id, command_id, payload),
@@ -233,6 +244,14 @@ class HubRequestHandler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
         self.wfile.write(body)
+
+    def _send_binary(self, status_code: int, payload: bytes, content_type: str) -> None:
+        self.send_response(status_code)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(payload)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(payload)
 
     def _send_error_json(self, status_code: int, message: str) -> None:
         self._send_json(status_code, {"error": message})

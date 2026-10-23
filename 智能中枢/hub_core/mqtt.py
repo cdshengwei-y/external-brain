@@ -32,14 +32,17 @@ class PahoMqttTransport:
         self.port = port
         self.topic_prefix = topic_prefix.rstrip("/")
         self.on_message = on_message
-        self.client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=client_id)
+        try:
+            self.client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=client_id)
+        except AttributeError:  # paho-mqtt 1.x compatibility
+            self.client = mqtt.Client(client_id=client_id)
         self.client.on_message = self._handle_message
         self.client.connect(self.host, self.port, keepalive=30)
         self.client.subscribe(f"{self.topic_prefix}/devices/+/manifest", qos=1)
         self.client.subscribe(f"{self.topic_prefix}/devices/+/availability", qos=1)
         self.client.subscribe(f"{self.topic_prefix}/devices/+/state", qos=1)
         self.client.subscribe(f"{self.topic_prefix}/devices/+/events", qos=1)
-        self.client.subscribe(f"{self.topic_prefix}/devices/+/command-acks", qos=1)
+        self.client.subscribe(f"{self.topic_prefix}/devices/+/acks", qos=1)
         self.client.loop_start()
 
     def close(self) -> None:
@@ -48,11 +51,15 @@ class PahoMqttTransport:
 
     def publish_command(self, device_id: str, envelope: Dict[str, Any]) -> None:
         topic = f"{self.topic_prefix}/devices/{device_id}/commands"
-        self.client.publish(topic, json.dumps(envelope, ensure_ascii=False), qos=1)
+        info = self.client.publish(topic, json.dumps(envelope, ensure_ascii=False), qos=1, retain=False)
+        if getattr(info, "rc", 0) != 0:
+            raise MqttUnavailableError("MQTT 命令发布失败")
 
     def publish_cancel(self, device_id: str, envelope: Dict[str, Any]) -> None:
         topic = f"{self.topic_prefix}/devices/{device_id}/commands"
-        self.client.publish(topic, json.dumps(envelope, ensure_ascii=False), qos=1)
+        info = self.client.publish(topic, json.dumps(envelope, ensure_ascii=False), qos=1, retain=False)
+        if getattr(info, "rc", 0) != 0:
+            raise MqttUnavailableError("MQTT 取消命令发布失败")
 
     def _handle_message(self, _client: Any, _userdata: Any, message: Any) -> None:
         try:

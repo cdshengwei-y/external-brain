@@ -23,7 +23,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--mqtt-host", help="配置后启用 MQTT 设备总线")
     parser.add_argument("--mqtt-port", type=int, default=1883)
-    parser.add_argument("--mqtt-prefix", default="hub/v1")
+    parser.add_argument("--mqtt-prefix", default="agentos")
     parser.add_argument("--mqtt-client-id", default="smart-hub")
     parser.add_argument(
         "--bridge-host",
