@@ -1,0 +1,45 @@
+{
+  "protocol_version": "1.0",
+  "package_type": "smart_home_device",
+  "package_id": "bean_ye_recorder_package",
+  "package_version": "1.0.0",
+  "manifest": {
+    "device_id": "bean_ye_1",
+    "name": "录音豆",
+    "device_type": "recorder",
+    "location": "桌面",
+    "vendor": "unknown",
+    "capabilities": [
+      {
+        "name": "record.start",
+        "label": "开始录音",
+        "description": "开始录音",
+        "params_schema": {
+          "type": "object",
+          "properties": {},
+          "additionalProperties": false
+        }
+      },
+      {
+        "name": "record.stop",
+        "label": "停止录音",
+        "description": "停止录音",
+        "params_schema": {
+          "type": "object",
+          "properties": {},
+          "additionalProperties": false
+        }
+      },
+      {
+        "name": "status.read",
+        "label": "读取状态",
+        "description": "读取录音豆当前状态",
+        "params_schema": {
+          "type": "object",
+          "properties": {},
+          "additionalProperties": false
+        }
+      }
+    ]
+  }
+}

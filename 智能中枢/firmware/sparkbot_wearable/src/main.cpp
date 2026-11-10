@@ -4,7 +4,7 @@
 
 #include "board_config.h"
 
-#if !defined(AUDIO_PROBE) && !defined(AUDIO_CAPTURE)
+#if !defined(AUDIO_PROBE) && !defined(AUDIO_CAPTURE) && !defined(LCD_TEST) && !defined(FOUNTAIN)
 
 namespace {
 

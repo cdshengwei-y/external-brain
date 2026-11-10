@@ -3,10 +3,14 @@ from __future__ import annotations
 import base64
 import binascii
 import json
+import os
+import ssl
 import urllib.error
 import urllib.request
 import uuid
 from typing import Any, Dict, Optional, Tuple
+
+DEFAULT_BASE_URL = "https://192.168.0.153:18005"
 
 
 class QwenAsrError(RuntimeError):
@@ -14,15 +18,34 @@ class QwenAsrError(RuntimeError):
 
 
 class QwenAsrClient:
-    """Client for the LAN Qwen3-ASR service used by the recording-bean backend."""
+    """Client for the LAN Qwen3-ASR service used by the recording-bean backend.
+
+    服务端（Qwen3-ASR-1.7B）用的是自签证书（CN=qwen3-asr-local），所以 HTTPS
+    连接必须放开证书校验；局域网内服务，不做 PKI 验证。
+    """
 
     def __init__(
         self,
-        base_url: str = "http://192.168.0.153:18005",
+        base_url: Optional[str] = None,
         timeout_seconds: float = 600.0,
     ) -> None:
-        self.base_url = base_url.rstrip("/")
+        resolved = base_url or os.environ.get("QWEN_ASR_BASE_URL") or DEFAULT_BASE_URL
+        self.base_url = resolved.rstrip("/")
         self.timeout_seconds = timeout_seconds
+        self._ssl_context: Optional[ssl.SSLContext] = None
+        if self.base_url.lower().startswith("https://"):
+            context = ssl.create_default_context()
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+            self._ssl_context = context
+        # 局域网直连：显式清空代理，否则会被 HTTP_PROXY 抢走请求。
+        handlers: list[Any] = [urllib.request.ProxyHandler({})]
+        if self._ssl_context is not None:
+            handlers.append(urllib.request.HTTPSHandler(context=self._ssl_context))
+        self._opener = urllib.request.build_opener(*handlers)
+
+    def _open(self, request: urllib.request.Request):
+        return self._opener.open(request, timeout=self.timeout_seconds)
 
     def health(self) -> Dict[str, Any]:
         return self._request_json("GET", "/health")
@@ -41,7 +64,7 @@ class QwenAsrClient:
             method="POST",
         )
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
+            with self._open(request) as response:
                 payload = json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as error:
             detail = self._error_detail(error)
@@ -67,7 +90,7 @@ class QwenAsrClient:
             method=method,
         )
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
+            with self._open(request) as response:
                 payload = json.loads(response.read().decode("utf-8"))
         except (urllib.error.URLError, TimeoutError) as error:
             raise QwenAsrError(f"无法连接千问 ASR 服务：{error}") from error

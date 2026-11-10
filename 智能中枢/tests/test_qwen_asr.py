@@ -21,9 +21,9 @@ class FakeResponse:
 
 
 class QwenAsrClientTest(unittest.TestCase):
-    @patch("agent_gateway.qwen_asr.urllib.request.urlopen")
-    def test_transcribe_uses_recording_bean_multipart_contract(self, urlopen):
-        urlopen.return_value = FakeResponse(
+    @patch.object(QwenAsrClient, "_open")
+    def test_transcribe_uses_recording_bean_multipart_contract(self, open_mock):
+        open_mock.return_value = FakeResponse(
             {
                 "text": "开始录音。",
                 "language": "Chinese",
@@ -41,7 +41,7 @@ class QwenAsrClientTest(unittest.TestCase):
         )
 
         self.assertEqual(response["text"], "开始录音。")
-        request = urlopen.call_args.args[0]
+        request = open_mock.call_args.args[0]
         self.assertEqual(request.full_url, "http://192.168.0.153:18005/transcribe")
         self.assertEqual(request.method, "POST")
         self.assertIn(b'name="file"', request.data)

@@ -54,7 +54,7 @@ class RealRouteVerifier:
         self._check_chat("你能做什么")
         self._check_hardware_plan(
             name="自然语言查询状态",
-            text="帮我看看录音豆现在的状态",
+            text="查询录音豆状态",
             expected_capability="status.read",
             save_status_plan=True,
         )

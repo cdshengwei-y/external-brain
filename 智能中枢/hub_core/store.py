@@ -163,6 +163,8 @@ class HubStore:
             self._ensure_column(
                 "portable_requests", "response_audio_content_type", "TEXT"
             )
+            # 设备动作参数（点歌的流地址、曲名等），与 session_action 配套透传给固件
+            self._ensure_column("portable_requests", "device_action", "TEXT")
 
     def _ensure_column(self, table: str, column: str, definition: str) -> None:
         columns = {
@@ -493,6 +495,7 @@ class HubStore:
         command_id: Optional[str] = None,
         response_text: Optional[str] = None,
         session_action: Optional[str] = None,
+        device_action: Optional[Dict[str, Any]] = None,
         response_audio: Optional[bytes] = None,
         response_audio_format: Optional[str] = None,
         response_audio_content_type: Optional[str] = None,
@@ -500,10 +503,22 @@ class HubStore:
         error_code: Optional[str] = None,
         error_message: Optional[str] = None,
         retryable: Optional[bool] = None,
+        text: Optional[str] = None,
+        input_type: Optional[str] = None,
+        session_mode: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         request = self.get_portable_request(request_id)
         if request is None:
             return None
+        # text / input_type / session_mode 平时不变，只有「唤醒 + 连锁指令」
+        # 会把一条 wake 请求就地改写成 conversation 请求重走管线。
+        next_text = text if text is not None else request.get("text")
+        next_input_type = (
+            input_type if input_type is not None else request.get("input_type")
+        )
+        next_session_mode = (
+            session_mode if session_mode is not None else request.get("session_mode")
+        )
         next_state = state if state is not None else request["state"]
         next_intent = intent if intent is not None else request["intent"]
         next_transcript = transcript if transcript is not None else request["transcript"]
@@ -516,6 +531,11 @@ class HubStore:
             session_action
             if session_action is not None
             else request["session_action"]
+        )
+        next_device_action = (
+            device_action
+            if device_action is not None
+            else request.get("device_action")
         )
         next_response_audio = (
             response_audio
@@ -543,8 +563,9 @@ class HubStore:
                 """
                 UPDATE portable_requests
                 SET state = ?, intent = ?, transcript = ?, plan_id = ?, command_id = ?, response_text = ?,
-                    session_action = ?, response_audio = ?, response_audio_format = ?,
+                    session_action = ?, device_action = ?, response_audio = ?, response_audio_format = ?,
                     response_audio_content_type = ?, result = ?, error_code = ?, error_message = ?, retryable = ?,
+                    text = ?, input_type = ?, session_mode = ?,
                     updated_at = ?
                 WHERE request_id = ?
                 """,
@@ -558,6 +579,9 @@ class HubStore:
                     next_command_id,
                     next_response_text,
                     next_session_action,
+                    json.dumps(next_device_action, ensure_ascii=False)
+                    if next_device_action is not None
+                    else None,
                     sqlite3.Binary(next_response_audio)
                     if next_response_audio is not None
                     else None,
@@ -569,6 +593,9 @@ class HubStore:
                     next_error_code,
                     next_error_message,
                     1 if next_retryable else 0,
+                    next_text,
+                    next_input_type,
+                    next_session_mode,
                     utc_now(),
                     request_id,
                 ),
@@ -678,6 +705,7 @@ class HubStore:
             "command_id": row["command_id"],
             "response_text": row["response_text"],
             "session_action": row["session_action"],
+            "device_action": _json_loads(row["device_action"], None),
             "response_audio": (
                 bytes(row["response_audio"])
                 if row["response_audio"] is not None

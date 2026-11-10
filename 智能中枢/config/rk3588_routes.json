@@ -1,0 +1,102 @@
+{
+  "_comment": "RK3588 命令 API 的路由表。已按 COMMAND_API_ROUTE_RESPONSE_2026-10-26.md 回填。",
+  "_status": "confirmed",
+  "_note": "2026-10-26 实测：GET /devices 返回 200；POST /commands 可达并返回 DEVICE_TIMEOUT / DEVICE_UNVERIFIED。",
+  "_role": "兜底诊断。主路径是插件的 MCP 工具，插件内部自己拼这些路由；本文件仅供 tools/rk3588_command.py 直连排障时使用。",
+
+  "base_url": "http://192.168.0.140:8099",
+  "tenant": "tenant-a",
+  "actor_ref": "hardware-agent",
+
+  "_tenant_style": "对方确认：tenant 走请求体字段 tenant_id，不是 HTTP 请求头。",
+  "tenant_style": "body",
+  "tenant_header": null,
+
+  "timeout_s": 20,
+
+  "routes": {
+    "list_devices": {
+      "method": "GET",
+      "path": "/api/agentos/v1/devices",
+      "body": null
+    },
+    "status_read": {
+      "method": "POST",
+      "path": "/api/agentos/v1/commands",
+      "body": {
+        "protocol_version": "1.0",
+        "request_id": "{request_id}",
+        "conversation_id": "{conversation_id}",
+        "plan_id": "{plan_id}",
+        "tenant_id": "{tenant}",
+        "actor_ref": "{actor_ref}",
+        "user_request": "{user_request}",
+        "command": {
+          "device_id": "{device_id}",
+          "capability": "status.read",
+          "params": {}
+        }
+      }
+    },
+    "record_start": {
+      "method": "POST",
+      "path": "/api/agentos/v1/commands",
+      "body": {
+        "protocol_version": "1.0",
+        "request_id": "{request_id}",
+        "conversation_id": "{conversation_id}",
+        "plan_id": "{plan_id}",
+        "tenant_id": "{tenant}",
+        "actor_ref": "{actor_ref}",
+        "user_request": "{user_request}",
+        "command": {
+          "device_id": "{device_id}",
+          "capability": "record.start",
+          "params": {}
+        }
+      }
+    },
+    "record_stop": {
+      "method": "POST",
+      "path": "/api/agentos/v1/commands",
+      "body": {
+        "protocol_version": "1.0",
+        "request_id": "{request_id}",
+        "conversation_id": "{conversation_id}",
+        "plan_id": "{plan_id}",
+        "tenant_id": "{tenant}",
+        "actor_ref": "{actor_ref}",
+        "user_request": "{user_request}",
+        "command": {
+          "device_id": "{device_id}",
+          "capability": "record.stop",
+          "params": {}
+        }
+      }
+    },
+    "command_result": {
+      "method": "GET",
+      "path": null,
+      "body": null,
+      "_note": "对方明确回复 none：同步返回终态，无轮询接口、无取消接口。"
+    }
+  },
+
+  "_template_vars": "path / body 里可用 {device_id} {tenant} {actor_ref} {request_id} {conversation_id} {plan_id} {user_request} {capability} 占位",
+
+  "_error_codes": [
+    "UNAUTHORIZED",
+    "INVALID_PARAMS",
+    "DEVICE_NOT_FOUND",
+    "CAPABILITY_NOT_SUPPORTED",
+    "PROFILE_NOT_SUPPORTED",
+    "DEVICE_ALREADY_BOUND",
+    "DEVICE_TIMEOUT",
+    "DEVICE_ACK_INVALID",
+    "MQTT_UNAVAILABLE",
+    "DUPLICATE_REQUEST",
+    "QUEUE_FULL"
+  ],
+
+  "_idempotency": "tenant_id + request_id。同键同内容返回首次结果；同键不同参数返回 DUPLICATE_REQUEST。"
+}

@@ -417,3 +417,40 @@ hub/v1/devices/{device_id}/command-acks
 当前开发电脑的局域网地址是 `192.168.0.107`，真实设备的 MQTT Broker 地址应填写这个地址。该 LAN 配置只适合可信家庭网络联调，仍然没有认证和 TLS。
 
 ESP32 接入模板位于 `firmware/esp32_recording_beam_template/`。它只实现协议骨架，真实录音豆的芯片、引脚和音频功能仍需根据硬件资料补齐。
+
+### 10.2 录音豆真实在线闭环验收
+
+设备恢复联网后，先确认 MQTT 保留在线状态，再执行 RK3588 规划、确认和真实设备 ACK 验收：
+
+```bash
+PYTHONPATH=. python3 tools/verify_recording_bean_closed_loop.py \\
+  --rk-url http://192.168.0.140:8095 \\
+  --mqtt-host 192.168.0.107 \\
+  --device-id bean_ye_1 \\
+  --execute-actions
+```
+
+脚本会依次验证：
+
+1. `hub/v1/devices/bean_ye_1/availability` 的实时 retained 值为 `online`；
+2. RK3588 为 `status.read`、`record.start`、`record.stop` 返回合法 `plan_id` 和能力参数；
+3. 每条计划通过 `/api/hub/v1/commands` 下发，并且只有桥返回真实设备 `succeeded` ACK 才算通过。
+
+不带 `--execute-actions` 时只执行 `status.read`，不会改变录音状态。历史 `state.online=true`、旧的 `wifi_ip` 或规划响应都不能替代 availability 和最终 ACK。
+
+## 11. 桌宠智能化（模型工具循环 + MCP 硬件插件）
+
+桌宠已从"关键词转发"升级为"对话宿主 + MCP 客户端"：唤醒后的每一轮对话由模型判断是否需要调用硬件工具，写操作先播报确认，插件返回 `succeeded` 才播报完成。
+
+```text
+唤醒 -> ASR -> PetAgent（工具循环）-> hardware-agent-mcp -> RK3588/设备
+                        ^                    |
+                        └──── 工具结果回填 ────┘
+```
+
+启动与配置见 `PET_AGENT_INTEGRATION_2026-10-26.md`；本机无插件 exe 时可用 mock 直接联调：
+
+```bash
+python3 tools/pet_agent_console.py --demo
+python3 -m unittest tests.test_hardware_mcp tests.test_pet_agent -v
+```

@@ -8,8 +8,31 @@ from typing import Any, Dict, Optional
 
 from .errors import HubError, ValidationError
 from .models import TERMINAL_COMMAND_STATES
+from agent_gateway.device import VOLUME_GAINS
 from agent_gateway.portable import PortableRequestService
 from .service import HubService
+
+
+def _pcm_wav_header(data_bytes: int, rate: int = 16000) -> bytes:
+    """生成 16k / 单声道 / 16bit 的 44 字节 WAV 头。"""
+    import struct
+
+    return struct.pack(
+        "<4sI4s4sIHHIIHH4sI",
+        b"RIFF",
+        36 + data_bytes,
+        b"WAVE",
+        b"fmt ",
+        16,
+        1,
+        1,
+        rate,
+        rate * 2,
+        2,
+        16,
+        b"data",
+        data_bytes,
+    )
 
 
 class HubRequestHandler(BaseHTTPRequestHandler):
@@ -37,6 +60,17 @@ class HubRequestHandler(BaseHTTPRequestHandler):
             if parsed.path.startswith("/api/v1/portable/v1/requests/"):
                 request_id = parsed.path.rstrip("/").split("/")[-1]
                 self._send_json(200, self.portable_service.get(request_id))
+                return
+            if (
+                parsed.path.startswith("/api/v1/portable/v1/music/")
+                and parsed.path.endswith("/stream")
+            ):
+                track_id = parsed.path.rstrip("/").split("/")[-2]
+                self._stream_music(track_id)
+                return
+            if parsed.path.startswith("/api/v1/portable/v1/devices/"):
+                device_id = parsed.path.rstrip("/").split("/")[-1]
+                self._send_json(200, self._portable_device_view(device_id))
                 return
             if parsed.path == "/api/v1/devices":
                 self._send_json(200, {"devices": self.service.list_devices()})
@@ -120,6 +154,10 @@ class HubRequestHandler(BaseHTTPRequestHandler):
                 request = self.portable_service.confirm(request_id, plan_id.strip())
                 self._send_json(202, request)
                 return
+            if parsed.path.startswith("/api/v1/portable/v1/devices/") and parsed.path.endswith("/volume"):
+                device_id = parsed.path.strip("/").split("/")[-2]
+                self._send_json(200, self._set_portable_volume(device_id, payload))
+                return
             if parsed.path == "/internal/v1/devices/register":
                 self._send_json(201, self.service.register_device(payload))
                 return
@@ -142,6 +180,57 @@ class HubRequestHandler(BaseHTTPRequestHandler):
             self._send_error_json(400, "请求体必须是有效 JSON")
         except Exception as error:  # pragma: no cover - defensive HTTP boundary
             self._send_error_json(500, f"中枢内部错误: {error}")
+
+    # ---------------- 桌宠设备影子（说话音量/音乐档位） ----------------
+
+    @property
+    def device_registry(self):
+        registry = getattr(self.portable_service, "devices", None)
+        if registry is None:
+            raise HubError("设备影子未启用", status_code=503)
+        return registry
+
+    def _portable_device_view(self, device_id: str) -> Dict[str, Any]:
+        profile = self.device_registry.get(device_id)
+        return {
+            "device_id": profile.device_id,
+            "volume_step": profile.volume_step + 1,
+            "volume_total": len(VOLUME_GAINS),
+            "volume_gain": round(profile.volume_gain, 3),
+            "volume_label": profile.volume_label,
+            "music_step": (
+                None if profile.music_step is None else profile.music_step + 1
+            ),
+            "music": profile.music,
+            "screen": profile.screen,
+            "fountain": profile.fountain,
+            "battery": profile.battery,
+            "updated_at": profile.updated_at,
+            "summary": profile.summary(),
+        }
+
+    def _set_portable_volume(
+        self, device_id: str, payload: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        registry = self.device_registry
+        raw_step = payload.get("step", payload.get("volume_step", payload.get("level")))
+        if raw_step is not None:
+            try:
+                step = int(raw_step)
+            except (TypeError, ValueError):
+                raise ValidationError("step 必须是 1 到 5 的整数")
+            if not 1 <= step <= len(VOLUME_GAINS):
+                raise ValidationError(f"step 必须在 1 到 {len(VOLUME_GAINS)} 之间")
+            registry.set_volume(device_id, step - 1)
+        elif payload.get("delta") is not None:
+            try:
+                delta = int(payload["delta"])
+            except (TypeError, ValueError):
+                raise ValidationError("delta 必须是整数")
+            registry.nudge_volume(device_id, delta)
+        else:
+            raise ValidationError("需要 step（1-5）或 delta")
+        return self._portable_device_view(device_id)
 
     def _handle_internal_device_post(self, path: str, payload: Dict[str, Any]) -> None:
         parts = path.strip("/").split("/")
@@ -244,6 +333,57 @@ class HubRequestHandler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
         self.wfile.write(body)
+
+    def _stream_music(self, track_id: str) -> None:
+        """按字节范围输出 16k 单声道 WAV，支持暂停 / 重播后的 Range 续播。"""
+        try:
+            info = self.portable_service.music.stream_info(track_id)
+        except Exception as error:  # noqa: BLE001 - 音频准备失败统一转成 404/500
+            self._send_error_json(404, f"音频不可用: {error}")
+            return
+
+        data_offset = int(info["data_offset"])
+        data_bytes = int(info["data_bytes"])
+        if data_bytes <= 0:
+            self._send_error_json(404, "音频为空")
+            return
+
+        start = 0
+        range_header = (self.headers.get("Range") or "").strip()
+        if range_header.lower().startswith("bytes="):
+            raw = range_header.split("=", 1)[1].split("-", 1)[0].strip()
+            if raw.isdigit():
+                start = int(raw)
+        start = max(0, min(start, data_bytes))
+        remaining = data_bytes - start
+
+        header = _pcm_wav_header(remaining)
+        self.send_response(206 if range_header else 200)
+        self.send_header("Content-Type", "audio/wav")
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Content-Length", str(len(header) + remaining))
+        self.send_header("Cache-Control", "no-store")
+        if range_header:
+            self.send_header(
+                "Content-Range",
+                f"bytes {start}-{data_bytes - 1}/{data_bytes}",
+            )
+        self.end_headers()
+
+        try:
+            self.wfile.write(header)
+            with open(info["path"], "rb") as handle:
+                handle.seek(data_offset + start)
+                left = remaining
+                while left > 0:
+                    chunk = handle.read(min(65536, left))
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    left -= len(chunk)
+        except (BrokenPipeError, ConnectionResetError):
+            # 设备暂停 / 停止会直接断连，属于正常路径
+            pass
 
     def _send_binary(self, status_code: int, payload: bytes, content_type: str) -> None:
         self.send_response(status_code)
