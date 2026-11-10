@@ -10,16 +10,16 @@
 
 from __future__ import annotations
 
+import http.client
 import json
 import logging
 import os
 import threading
 import time
-import urllib.error
-import urllib.request
 import uuid
 from collections import deque
 from dataclasses import dataclass, field
+from urllib.parse import urlsplit
 from typing import Any, Deque, Dict, List, Mapping, Optional, Protocol, Sequence
 
 from .hardware_mcp import (
@@ -145,8 +145,8 @@ class ChatModelError(RuntimeError):
 # 那台机器 ping 100% 丢包、chat 502 upstream refused —— 看着像它挂了，
 # 但关掉代理立刻恢复（chat 200 / 1.1s）。根因是 TUN/透明代理在网络层把**内网**
 # 流量也劫走了。清 HTTP_PROXY 环境变量不够：macOS 上 urlopen 还会读系统代理设置
-# （_scproxy），所以这里挂一个空 ProxyHandler，从代码层面绕开一切代理。
-_NO_PROXY_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+# （_scproxy）。2026-11-10 起请求改走 http.client 直连——它天生不读任何
+# 代理设置，比当年的 ProxyHandler({}) 更彻底；这里的教训保留作历史注脚。
 
 
 @dataclass
@@ -184,6 +184,12 @@ class OpenAICompatibleChatModel:
         self.max_tokens = max_tokens
         # sub2api / sw-bot 这类站点前面挂了 WAF，非浏览器 UA 会直接 403。
         self.user_agent = user_agent
+        # keep-alive 连接池：245 那条链路有 1~2% 的间歇性丢包（2026-11-10 实测），
+        # urllib 每次请求都重新走 TCP 握手，一个 SYN 丢了就是 1 秒起步的卡顿。
+        # 复用连接后只在第一次建链，后续请求零握手，抖动窗口直接砍掉一大块。
+        # http.client 天生不走任何代理（比 ProxyHandler({}) 更彻底）。
+        self._pool_lock = threading.Lock()
+        self._idle_conns: List[http.client.HTTPConnection] = []
 
     @classmethod
     def from_env(
@@ -205,6 +211,76 @@ class OpenAICompatibleChatModel:
             or ""
         ).strip()
         return cls(base_url, model, api_key or None)
+
+    # -- keep-alive 连接池 -------------------------------------------------
+
+    def _new_conn(self, target: Any) -> http.client.HTTPConnection:
+        factory = (
+            http.client.HTTPSConnection if target.scheme == "https" else http.client.HTTPConnection
+        )
+        conn = factory(target.hostname, target.port, timeout=self.timeout_seconds)
+        setattr(conn, "pool_key", (target.scheme, target.hostname, target.port))
+        return conn
+
+    def _acquire_conn(self, target: Any) -> tuple[http.client.HTTPConnection, bool]:
+        """取一条连接：优先复用池里的空闲连接（reused=True），否则新建。"""
+        key = (target.scheme, target.hostname, target.port)
+        with self._pool_lock:
+            while self._idle_conns:
+                conn = self._idle_conns.pop()
+                if getattr(conn, "pool_key", None) == key:
+                    return conn, True
+                try:  # 池里混进了别的端点的连接（不该发生），关掉别浪费
+                    conn.close()
+                except OSError:
+                    pass
+        return self._new_conn(target), False
+
+    def _release_conn(self, conn: http.client.HTTPConnection, reusable: bool) -> None:
+        if reusable:
+            with self._pool_lock:
+                if len(self._idle_conns) < 4:  # 池子不深，桌宠同时也就一两路
+                    self._idle_conns.append(conn)
+                    return
+        try:
+            conn.close()
+        except OSError:
+            pass
+
+    def _post_persistent(
+        self, target: Any, body: bytes, headers: Dict[str, str]
+    ) -> Dict[str, Any]:
+        """keep-alive POST：池里拿连接 → 发请求 → 可复用就还回池子。
+
+        池里的连接可能早已被链路抖断（对端 RST、中间设备悄悄丢状态），
+        所以**复用连接上的第一次失败**免费换一条全新连接重试一次；
+        新连接再失败才向上抛 —— 真正的服务端故障不会被这个重试放大。
+        """
+        path = target.path or "/"
+        if target.query:
+            path = f"{path}?{target.query}"
+        for attempt in (1, 2):
+            conn, reused = self._acquire_conn(target)
+            try:
+                conn.request("POST", path, body=body, headers=headers)
+                response = conn.getresponse()
+                raw = response.read()
+                reusable = not response.will_close
+                status = response.status
+            except (http.client.HTTPException, OSError):
+                self._release_conn(conn, False)
+                if reused and attempt == 1:
+                    continue  # 换新连接再试一次（旧连接八成是断着的）
+                raise
+            self._release_conn(conn, reusable)
+            if status >= 400:
+                detail = raw.decode("utf-8", "replace")[:300]
+                raise ChatModelError(f"模型接口返回 HTTP {status}: {detail}")
+            try:
+                return json.loads(raw.decode("utf-8"))
+            except (json.JSONDecodeError, UnicodeDecodeError) as error:
+                raise ChatModelError("模型接口返回的不是有效 JSON") from error
+        raise ChatModelError("模型接口连接重试失败")  # 理论不可达，防御兜底
 
     def complete(
         self,
@@ -230,24 +306,16 @@ class OpenAICompatibleChatModel:
             headers["Authorization"] = f"Bearer {self.api_key}"
         if self.user_agent:
             headers["User-Agent"] = self.user_agent
-        request = urllib.request.Request(
-            f"{self.base_url}/chat/completions",
-            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-            headers=headers,
-            method="POST",
-        )
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        target = urlsplit(f"{self.base_url}/chat/completions")
         try:
-            with _NO_PROXY_OPENER.open(request, timeout=self.timeout_seconds) as response:
-                body = json.loads(response.read().decode("utf-8"))
-        except urllib.error.HTTPError as error:
-            detail = error.read().decode("utf-8", "replace")[:300]
-            raise ChatModelError(f"模型接口返回 HTTP {error.code}: {detail}") from error
-        except (urllib.error.URLError, TimeoutError) as error:
+            body_out = self._post_persistent(target, body, headers)
+        except ChatModelError:
+            raise
+        except (http.client.HTTPException, OSError) as error:
             raise ChatModelError(f"无法连接模型接口: {error}") from error
-        except (json.JSONDecodeError, UnicodeDecodeError) as error:
-            raise ChatModelError("模型接口返回的不是有效 JSON") from error
 
-        choices = body.get("choices")
+        choices = body_out.get("choices")
         if not isinstance(choices, list) or not choices:
             raise ChatModelError("模型接口没有返回 choices")
         message = choices[0].get("message") or {}

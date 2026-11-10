@@ -570,6 +570,62 @@ class ChatModelClientTest(unittest.TestCase):
             dead.complete([{"role": "user", "content": "hi"}])
 
 
+class KeepAliveConnectionTest(unittest.TestCase):
+    """245 链路有 1~2% 间歇性丢包（2026-11-10 实测），keep-alive 连接复用
+    砍掉每次请求的 TCP 握手抖动窗口。验证：连续两次请求走同一条 TCP 连接；
+    池子里的坏连接在失败后自动重建、HTTP 错误照常翻译。"""
+
+    def setUp(self):
+        import http.server
+        import threading
+
+        from agent_gateway.pet_agent import OpenAICompatibleChatModel
+
+        self.conn_ids = set()
+        conn_ids = self.conn_ids
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"  # 打开 keep-alive
+
+            def do_POST(self):
+                conn_ids.add(id(self.connection))
+                length = int(self.headers.get("Content-Length") or 0)
+                body = json.loads(self.rfile.read(length).decode("utf-8"))
+                data = b'{"error":"boom"}' if body.get("model") == "boom" else json.dumps(
+                    {"choices": [{"message": {"content": "ok"}}]}
+                ).encode("utf-8")
+                self.send_response(500 if body.get("model") == "boom" else 200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def log_message(self, *args):
+                pass
+
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.base_url = f"http://127.0.0.1:{self.server.server_port}/v1"
+        self.model = OpenAICompatibleChatModel(self.base_url, "test-model")
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+    def test_two_requests_reuse_one_connection(self):
+        for _ in range(2):
+            result = self.model.complete([{"role": "user", "content": "hi"}])
+            self.assertEqual(result["content"], "ok")
+        self.assertEqual(len(self.conn_ids), 1, "两次请求应复用同一条 TCP 连接")
+
+    def test_http_error_still_wrapped(self):
+        from agent_gateway.pet_agent import ChatModelError, OpenAICompatibleChatModel
+
+        broken = OpenAICompatibleChatModel(self.base_url, "boom")
+        with self.assertRaises(ChatModelError):
+            broken.complete([{"role": "user", "content": "hi"}])
+
+
 class _NoopPlanner:
     def plan_hub_command(self, **kwargs):
         raise AssertionError("启用桌宠大脑后不应再走 RK3588 规划")
