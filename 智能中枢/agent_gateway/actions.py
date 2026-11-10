@@ -29,6 +29,7 @@ import urllib.error
 import urllib.request
 import uuid
 from concurrent.futures import Future
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Optional, Union
 
@@ -331,7 +332,10 @@ class AgentMqttClient:
                     f"命令发布失败（rc={info.rc}）", kind="network"
                 )
             ack = future.result(timeout=self.timeout_seconds)
-        except TimeoutError:
+        except FutureTimeoutError:
+            # 注意不能用内置 TimeoutError：concurrent.futures.TimeoutError
+            # 直到 Python 3.11 才与内置 TimeoutError 合并，3.9/3.10 上是两个
+            # 类，catch 错了会把裸超时栈漏给调用方（测试曾在 3.9 上稳定失败）。
             raise AgentOSCommandError(
                 f"录音豆没在 {self.timeout_seconds:.0f} 秒内应答 {capability}",
                 error_code="ACK_TIMEOUT",
