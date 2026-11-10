@@ -1205,6 +1205,10 @@ class PortableRequestService:
                     return
                 if self._try_local_facts(request_id, text):
                     return
+                # 本机控制快通道（2026-11-10）：「打开WPS」命中别名表/网址
+                # 就本地直执行，省掉一次模型调用——那一下要 3~10 秒。
+                if self._try_local_host(request_id, text):
+                    return
                 # 第③步：意图判定。默认交给 bot / 模型，失败或无分类器时退回关键词。
                 if not self._rules_first and self._route_intent(
                     request_id, request, text, session_mode
@@ -2508,6 +2512,33 @@ class PortableRequestService:
             response_audio_content_type=audio[2] if audio else None,
             result={"intent": result.public()},
         )
+        return True
+
+    def _try_local_host(self, request_id: str, text: str) -> bool:
+        """本机控制快通道：「打开WPS / 退出微信 / 打开bilibili.com」。
+
+        命中 host_control.parse_voice_command（别名表或网址白名单）就本地
+        直执行——这句话过模型要 3~10 秒，快通道把回复压到 1 秒级。
+        白名单外的目标一律 return False 交给模型/意图路由兜底。
+        """
+        command = host_control.parse_voice_command(text)
+        if command is None:
+            return False
+        action, target = command
+        result = host_control.execute(action, target)
+        reply = str(result.get("message") or "这个操作我没做成。")
+        audio = self._synthesize(reply)
+        self._update(
+            request_id,
+            state="completed",
+            response_text=reply,
+            session_action="continue",
+            response_audio=audio[0] if audio else None,
+            response_audio_format=audio[1] if audio else None,
+            response_audio_content_type=audio[2] if audio else None,
+            result={"intent": {"intent": action, "source": "local-fast"}},
+        )
+        print(f"[HOST] 快通道：{action} {target}", flush=True)
         return True
 
     def _finish_fountain(self, request_id: str, fountain_action: str) -> None:

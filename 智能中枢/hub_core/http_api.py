@@ -22,75 +22,166 @@ CONTROL_PAGE_HTML = """<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>桌宠控制台</title>
 <style>
-  body { background:#0d1220; color:#e8ecf4; font-family:-apple-system,"PingFang SC",sans-serif; margin:0; padding:20px; max-width:720px; margin-inline:auto; }
-  h1 { font-size:22px; margin:0 0 4px; }
-  .sub { color:#8a94a8; font-size:13px; margin-bottom:18px; }
-  .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(110px,1fr)); gap:10px; margin-bottom:18px; }
-  button.app { background:#1a2236; color:#e8ecf4; border:1px solid #2a3550; border-radius:12px; padding:14px 8px; font-size:15px; cursor:pointer; }
-  button.app:active { background:#243154; }
-  .row { display:flex; gap:8px; margin-bottom:8px; }
-  input { flex:1; background:#131a2c; color:#e8ecf4; border:1px solid #2a3550; border-radius:10px; padding:12px; font-size:15px; }
-  button.go { background:#2f6fed; color:#fff; border:none; border-radius:10px; padding:12px 22px; font-size:15px; cursor:pointer; }
-  .result { min-height:22px; color:#9fe8b8; font-size:14px; margin:10px 0 20px; }
-  .result.err { color:#ff9d9d; }
-  h2 { font-size:16px; color:#b8c2d8; }
+  :root {
+    --bg1:#0a0e1a; --bg2:#141b2e; --card:rgba(30,40,64,.55); --card-hover:rgba(48,64,104,.75);
+    --line:rgba(120,150,220,.14); --text:#eef2fb; --dim:#8a94ab; --accent:#5b8cff; --ok:#4ade80; --fail:#fb7185;
+  }
+  * { box-sizing:border-box; }
+  body {
+    background: radial-gradient(1200px 700px at 20% -10%, #1b2444 0%, transparent 55%),
+                radial-gradient(900px 600px at 110% 10%, #1d2a52 0%, transparent 50%),
+                linear-gradient(160deg, var(--bg1), var(--bg2));
+    background-attachment: fixed;
+    color:var(--text); font-family:-apple-system,"PingFang SC",sans-serif;
+    margin:0; padding:28px 20px 60px; max-width:760px; margin-inline:auto; min-height:100vh;
+  }
+  header { display:flex; align-items:center; gap:12px; margin-bottom:6px; }
+  header .logo { font-size:30px; }
+  h1 { font-size:21px; margin:0; letter-spacing:.5px; }
+  .status { display:inline-flex; align-items:center; gap:6px; font-size:12px; color:var(--dim);
+            background:var(--card); border:1px solid var(--line); padding:4px 12px; border-radius:99px; }
+  .dot { width:8px; height:8px; border-radius:50%; background:var(--ok); box-shadow:0 0 8px var(--ok); }
+  .dot.off { background:var(--fail); box-shadow:0 0 8px var(--fail); }
+  .sub { color:var(--dim); font-size:13px; margin:6px 0 22px; line-height:1.6; }
+  .sub b { color:#b9c6e8; font-weight:500; }
+  .mode { display:inline-flex; background:var(--card); border:1px solid var(--line); border-radius:12px;
+          padding:4px; gap:4px; margin-bottom:16px; }
+  .mode button { background:transparent; color:var(--dim); border:none; border-radius:9px;
+                 padding:8px 20px; font-size:14px; cursor:pointer; transition:.15s; }
+  .mode button.on { background:var(--accent); color:#fff; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(96px,1fr)); gap:12px; margin-bottom:20px; }
+  .card {
+    background:var(--card); border:1px solid var(--line); border-radius:16px;
+    padding:16px 6px 12px; text-align:center; cursor:pointer; user-select:none;
+    backdrop-filter: blur(10px); transition:transform .15s, background .15s, border-color .15s;
+  }
+  .card:hover { transform:translateY(-3px); background:var(--card-hover); border-color:rgba(120,150,220,.35); }
+  .card:active { transform:translateY(0) scale(.97); }
+  .card .icon { font-size:26px; margin-bottom:6px; }
+  .card .name { font-size:13px; color:#c9d3e8; }
+  .panel { background:var(--card); border:1px solid var(--line); border-radius:16px; padding:14px;
+           backdrop-filter: blur(10px); margin-bottom:22px; }
+  .row { display:flex; gap:8px; }
+  input { flex:1; background:rgba(10,14,26,.6); color:var(--text); border:1px solid var(--line);
+          border-radius:10px; padding:11px 14px; font-size:15px; outline:none; }
+  input:focus { border-color:var(--accent); }
+  .btn { background:var(--accent); color:#fff; border:none; border-radius:10px; padding:11px 20px;
+         font-size:14px; cursor:pointer; transition:.15s; }
+  .btn.ghost { background:rgba(90,110,160,.25); }
+  .btn:active { transform:scale(.97); }
+  #toast { position:fixed; left:50%; bottom:36px; transform:translateX(-50%) translateY(20px);
+           background:#1d2740; color:var(--text); border:1px solid var(--line); border-radius:12px;
+           padding:12px 22px; font-size:14px; opacity:0; pointer-events:none; transition:.25s;
+           box-shadow:0 10px 30px rgba(0,0,0,.45); max-width:86vw; }
+  #toast.show { opacity:1; transform:translateX(-50%) translateY(0); }
+  #toast.ok { border-color:rgba(74,222,128,.4); } #toast.fail { border-color:rgba(251,113,133,.45); }
+  h2 { font-size:15px; color:#b9c6e8; margin:0 0 10px; font-weight:500; }
   table { width:100%; border-collapse:collapse; font-size:13px; }
-  td, th { text-align:left; padding:6px 8px; border-bottom:1px solid #1c2438; color:#c6cfdf; }
-  td.ok { color:#7fe0a0; } td.fail { color:#ff9d9d; }
-  .hint { color:#69748c; font-size:12px; margin-top:16px; line-height:1.7; }
+  td, th { text-align:left; padding:8px 10px; border-bottom:1px solid rgba(120,150,220,.08); color:#aeb9d2; }
+  th { color:var(--dim); font-weight:400; font-size:12px; }
+  td.ok { color:var(--ok); } td.fail { color:var(--fail); }
+  .hint { color:#69748c; font-size:12px; margin-top:18px; line-height:1.8; }
+  .empty { color:var(--dim); font-size:13px; padding:14px 10px; }
 </style>
 </head>
 <body>
-<h1>桌宠控制台</h1>
-<div class="sub">这台 Mac 的应用开关 · 和对着桌宠说「打开WPS」走的是同一条通道</div>
-<div class="grid" id="apps"></div>
-<div class="row">
-  <input id="target" placeholder="输入应用名或网址，如 WPS / 微信 / bilibili.com" onkeydown="if(event.key==='Enter')run('open_app')">
-  <button class="go" onclick="run('open_app')">打开</button>
-  <button class="go" style="background:#556" onclick="run('quit_app')">退出</button>
+<header>
+  <div class="logo">🐾</div>
+  <h1>桌宠控制台</h1>
+  <span class="status" style="margin-left:auto"><span class="dot" id="dot"></span><span id="statusText">检查中枢…</span></span>
+</header>
+<div class="sub">这台 Mac 的应用开关 · <b>和对着桌宠说「打开WPS」走同一条指令</b>，点卡片立即生效</div>
+<div class="mode" id="mode">
+  <button class="on" data-m="open">🔓 打开</button>
+  <button data-m="quit">🔒 退出</button>
 </div>
-<div class="result" id="result"></div>
+<div class="grid" id="apps"></div>
+<div class="panel">
+  <div class="row">
+    <input id="target" placeholder="输入应用名或网址：WPS / 微信 / bilibili.com" onkeydown="if(event.key==='Enter')go()">
+    <button class="btn" onclick="go()">执行</button>
+  </div>
+</div>
 <h2>最近动作</h2>
-<table id="log"><tr><th>时间</th><th>动作</th><th>目标</th><th>结果</th></tr></table>
-<div class="hint">语音同样可用：对桌宠说「打开WPS」「打开微信」「打开bilibili.com」「退出微信」。<br>新增应用喊法：编辑 agent_gateway/host_control.py 的 APP_ALIASES 后重启中枢。</div>
+<div class="panel"><table id="log"></table></div>
+<div class="hint">
+  语音同样可用：对桌宠说「打开WPS」「打开微信」「打开bilibili.com」「退出微信」——
+  白名单里的应用走本地快通道，说完 1 秒内就动手。<br>
+  新增应用喊法：编辑 <span style="color:#8fa3d0">agent_gateway/host_control.py</span> 的 APP_ALIASES 后重启中枢。
+</div>
+<div id="toast"></div>
 <script>
-const APPS = ["WPS","微信","企业微信","QQ","谷歌浏览器","Safari","VS Code","计算器","备忘录","飞书","百度网盘","ChatGPT","Docker","Obsidian"];
+const APP_ICONS = {"WPS":"📄","微信":"💬","企业微信":"💼","QQ":"🐧","谷歌浏览器":"🌐","Safari":"🧭",
+  "VS Code":"💻","计算器":"🧮","备忘录":"📝","飞书":"🐦","百度网盘":"☁️","ChatGPT":"🤖",
+  "Docker":"🐳","Obsidian":"📓"};
+const APPS = Object.keys(APP_ICONS);
+let mode = "open";
 const grid = document.getElementById('apps');
 APPS.forEach(name => {
-  const b = document.createElement('button');
-  b.className = 'app'; b.textContent = name;
-  b.onclick = () => run('open_app', name);
-  grid.appendChild(b);
+  const card = document.createElement('div');
+  card.className = 'card';
+  card.innerHTML = `<div class="icon">${APP_ICONS[name]}</div><div class="name">${name}</div>`;
+  card.onclick = () => exec(mode === "open" ? "open_app" : "quit_app", name);
+  grid.appendChild(card);
 });
-async function run(action, target) {
-  const t = target || document.getElementById('target').value.trim();
-  const el = document.getElementById('result');
-  if (!t) { el.textContent = '先输入应用名或网址'; el.className = 'result err'; return; }
+document.getElementById('mode').addEventListener('click', e => {
+  const b = e.target.closest('button'); if (!b) return;
+  mode = b.dataset.m;
+  document.querySelectorAll('.mode button').forEach(x => x.classList.toggle('on', x === b));
+});
+let toastTimer;
+function toast(msg, ok) {
+  const t = document.getElementById('toast');
+  t.textContent = msg; t.className = 'show ' + (ok ? 'ok' : 'fail');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => t.className = '', 2600);
+}
+async function exec(action, target) {
   try {
     const res = await fetch('/api/v1/host/exec', {
       method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({action, target: t})
+      body: JSON.stringify({action, target})
     });
     const data = await res.json();
-    el.textContent = data.message || JSON.stringify(data);
-    el.className = 'result' + (data.ok ? '' : ' err');
+    toast(data.message || JSON.stringify(data), data.ok);
     loadLog();
-  } catch (e) { el.textContent = '请求失败：' + e; el.className = 'result err'; }
+  } catch (e) { toast('请求失败：' + e, false); }
+}
+function go() {
+  const t = document.getElementById('target').value.trim();
+  if (!t) { toast('先输入应用名或网址', false); return; }
+  exec(mode === "open" ? "open_app" : "quit_app", t);
 }
 async function loadLog() {
-  const res = await fetch('/api/v1/host/log');
-  const data = await res.json();
-  const table = document.getElementById('log');
-  table.innerHTML = '<tr><th>时间</th><th>动作</th><th>目标</th><th>结果</th></tr>';
-  (data.actions || []).slice().reverse().forEach(a => {
-    const row = table.insertRow();
-    row.insertCell().textContent = a.ts || '';
-    row.insertCell().textContent = a.action === 'open_app' ? '打开应用' : a.action === 'quit_app' ? '退出应用' : '打开网址';
-    row.insertCell().textContent = a.target || '';
-    const c = row.insertCell(); c.textContent = a.ok ? '成功' : '失败'; c.className = a.ok ? 'ok' : 'fail';
-  });
+  try {
+    const res = await fetch('/api/v1/host/log');
+    const data = await res.json();
+    const table = document.getElementById('log');
+    const rows = (data.actions || []).slice().reverse();
+    if (!rows.length) { table.innerHTML = '<tr><td class="empty">还没有动作记录，点上面的卡片试试</td></tr>'; return; }
+    table.innerHTML = '<tr><th>时间</th><th>动作</th><th>目标</th><th>结果</th></tr>';
+    rows.forEach(a => {
+      const row = table.insertRow();
+      row.insertCell().textContent = (a.ts || '').slice(5);
+      row.insertCell().textContent = a.action === 'open_app' ? '打开' : a.action === 'quit_app' ? '退出' : '网址';
+      row.insertCell().textContent = a.target || '';
+      const c = row.insertCell(); c.textContent = a.ok ? '成功' : '失败'; c.className = a.ok ? 'ok' : 'fail';
+    });
+  } catch (e) {}
 }
-loadLog();
+async function checkHealth() {
+  const dot = document.getElementById('dot'), text = document.getElementById('statusText');
+  try {
+    const res = await fetch('/api/v1/health');
+    dot.className = 'dot'; text.textContent = '中枢在线';
+    dot.style.background = 'var(--ok)'; dot.style.boxShadow = '0 0 8px var(--ok)';
+  } catch (e) {
+    dot.className = 'dot off'; text.textContent = '中枢离线';
+    dot.style.background = 'var(--fail)'; dot.style.boxShadow = '0 0 8px var(--fail)';
+  }
+}
+loadLog(); checkHealth();
+setInterval(checkHealth, 10000);
 </script>
 </body>
 </html>

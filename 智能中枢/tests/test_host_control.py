@@ -114,5 +114,46 @@ class HostControlPluginTests(unittest.TestCase):
         self.assertEqual(result.session_action, "continue")
 
 
+class ParseVoiceCommandTests(unittest.TestCase):
+    """快通道解析：命中白名单直执行，白名单外交回模型。"""
+
+    def setUp(self):
+        from agent_gateway.host_control import parse_voice_command
+
+        self.parse = parse_voice_command
+
+    def test_basic_open(self):
+        self.assertEqual(self.parse("打开WPS"), ("open_app", "WPS"))
+        self.assertEqual(self.parse("打开微信"), ("open_app", "微信"))
+
+    def test_prefix_and_politeness(self):
+        self.assertEqual(self.parse("帮我打开WPS"), ("open_app", "WPS"))
+        self.assertEqual(self.parse("麻烦你打开一下微信"), ("open_app", "微信"))
+        self.assertEqual(self.parse("请退出微信"), ("quit_app", "微信"))
+
+    def test_quit_variants(self):
+        self.assertEqual(self.parse("关掉WPS"), ("quit_app", "WPS"))
+        self.assertEqual(self.parse("退出微信吧"), ("quit_app", "微信"))
+
+    def test_url_target(self):
+        self.assertEqual(self.parse("打开bilibili.com"), ("open_app", "bilibili.com"))
+
+    def test_non_host_targets_pass_through(self):
+        # 喷泉/音乐/灯不是这台 Mac 的事，必须交回对应通道
+        self.assertIsNone(self.parse("打开喷泉"))
+        self.assertIsNone(self.parse("打开音乐"))
+        self.assertIsNone(self.parse("帮我打开灯"))
+        self.assertIsNone(self.parse("退出录音豆"))
+
+    def test_unknown_apps_pass_through(self):
+        # 白名单外宁可慢一点也不乱开（ASR 抖动防误触）
+        self.assertIsNone(self.parse("打开我的心"))
+        self.assertIsNone(self.parse("打开随便什么"))
+
+    def test_non_commands(self):
+        self.assertIsNone(self.parse("WPS好用吗"))
+        self.assertIsNone(self.parse("你好"))
+
+
 if __name__ == "__main__":
     unittest.main()

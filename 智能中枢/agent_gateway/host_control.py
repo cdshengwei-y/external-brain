@@ -225,5 +225,57 @@ def execute(action: str, target: str) -> Dict[str, Any]:
     return {"ok": False, "message": f"不认识的动作：{action}"}
 
 
+# ---- 语音快通道解析 -----------------------------------------------------
+# 「打开WPS」这种指令不该过模型（模型今天 3~10 秒才回话），命中别名表/
+# 网址就本地直执行。白名单外的目标一律返回 None 交给模型兜底，
+# 保证「打开我的心」（ASR 抖动）不会误开程序。
+
+_OPEN_WORDS = ("打开", "开启", "启动", "运行", "开一下", "开个")
+_QUIT_WORDS = ("退出", "关闭", "关掉", "退掉", "停掉")
+_PREFIX_WORDS = ("麻烦你", "麻烦", "请你", "帮我", "给我", "请")
+# 这些目标不是这台 Mac 的事（喷泉/放歌归设备，灯/空调归外设），别抢
+_NON_HOST_MARKS = ("喷泉", "音乐", "歌", "灯", "空调", "电视", "录音", "豆")
+
+
+def parse_voice_command(text: str) -> Optional[tuple]:
+    """从一句语音文本里解析出本机控制指令。
+
+    返回 (action, target) 或 None（不是本机指令 / 目标不在白名单）。
+    """
+    cleaned = str(text or "").strip()
+    if not cleaned:
+        return None
+    for prefix in _PREFIX_WORDS:
+        if cleaned.startswith(prefix):
+            cleaned = cleaned[len(prefix):].strip()
+    action = None
+    for word in _OPEN_WORDS:
+        if cleaned.startswith(word):
+            action, cleaned = "open_app", cleaned[len(word):].strip()
+            break
+    if action is None:
+        for word in _QUIT_WORDS:
+            if cleaned.startswith(word):
+                action, cleaned = "quit_app", cleaned[len(word):].strip()
+                break
+    if action is None:
+        return None
+    # 去动词后的填充词（「打开一下微信」）和尾部语气词（「打开WPS了」）
+    for filler in ("一下", "一个", "个", "吧"):
+        while cleaned.startswith(filler):
+            cleaned = cleaned[len(filler):].strip()
+    for tail in ("一下", "了", "吧", "呗", "它"):
+        while cleaned.endswith(tail):
+            cleaned = cleaned[: -len(tail)].strip()
+    if not cleaned:
+        return None
+    if any(mark in cleaned for mark in _NON_HOST_MARKS):
+        return None  # 喷泉/音乐/灯……不是本机的事，交给对应通道
+    known = _normalize(cleaned) in APP_ALIASES or looks_like_url(cleaned)
+    if not known:
+        return None  # 白名单外：宁可慢一点也不乱开
+    return (action, cleaned)
+
+
 def recent(count: int = 20) -> List[Dict[str, Any]]:
     return list(_recent)[-count:]
