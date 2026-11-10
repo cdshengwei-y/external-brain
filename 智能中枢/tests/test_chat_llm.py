@@ -84,6 +84,32 @@ class FallbackTest(unittest.TestCase):
         backup = self._make("备用模型", "备用回复")
         self.assertEqual(FallbackChatClient([primary, backup]).send("hi"), "备用回复")
 
+    def test_repeated_hedge_hits_escalate_cooldown(self):
+        """245 整机被拖慢时（2026-11-10）不报错只是慢：固定 20s 冷却一到
+        就又被选中、再白等一个 hedge 周期。连续命中必须指数退避。"""
+        import time as time_mod
+
+        def slow_reply(*args, **kwargs):
+            time_mod.sleep(0.15)
+            return "慢回复"
+
+        primary = self._make("主模型", None)
+        primary.complete_only.side_effect = slow_reply
+        backup = self._make("备用模型", "备用回复")
+        hedged = FallbackChatClient(
+            [primary, backup],
+            hedge_after_seconds=0.03,
+            total_budget_seconds=0.5,
+            hedge_cooldown_seconds=1.0,
+        )
+        hedged.send("hi")  # 第 1 次命中：冷却 1s
+        self.assertAlmostEqual(hedged._down_until[0] - time_mod.monotonic(), 1.0, delta=0.2)
+        hedged.send("hi")  # 冷却中直接备用，命中次数不涨
+        self.assertEqual(hedged._hedge_streak.get(0), 1)
+        time_mod.sleep(1.05)  # 冷却到期
+        hedged.send("hi")  # 又慢：第 2 次命中，冷却翻倍到 2s
+        self.assertAlmostEqual(hedged._down_until[0] - time_mod.monotonic(), 2.0, delta=0.3)
+
     def test_all_failed_raises(self):
         primary = self._make("主模型", ChatModelError("连不上"))
         backup = self._make("备用模型", OSError("超时"))

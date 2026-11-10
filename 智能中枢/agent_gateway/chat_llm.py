@@ -355,6 +355,10 @@ class FallbackChatClient:
         # 2026-11-06 实测 245 那台机器：TCP 握手 0.5~7.5 秒、四次里三次超时，
         # 属于分钟级抖动，45 秒的固定冷却根本盖不住。
         self._fail_streak: Dict[int, int] = {}
+        # hedge 命中（不报错只是慢）的连续次数：2026-11-10 发现 245 整机被
+        # 拖慢时，固定 20s 冷却一到就又被选中、再白等一个 hedge 周期，
+        # 一句一句地耗。改成指数退避 20s→40s→80s→120s 封顶，成功归零。
+        self._hedge_streak: Dict[int, int] = {}
         # 每次调用最多同时打 len(clients) 个端点；复用线程池，避免每句都新建。
         self._executor = ThreadPoolExecutor(
             max_workers=max(2, len(clients)), thread_name_prefix="chat-hedge"
@@ -403,8 +407,14 @@ class FallbackChatClient:
         这 12 秒里每个新请求都还会再打它一次、再白等一个 hedge 周期，
         实测连续几句全卡在 6~8 秒。所以 hedge 命中即短期靠边，不等超时。
         不动 ``_fail_streak``：偶发一次的慢不该让它越退越远。
+        2026-11-10 升级：持续慢（整机被拖、几分钟回不来）时固定 20s 冷却
+        一到就又被选中。连续命中按 20s→40s→80s→120s 指数退避，
+        ``_accept`` 成功一次立刻清零 —— 恢复正常后马上回来当家。
         """
-        until = time.monotonic() + self.hedge_cooldown_seconds
+        streak = self._hedge_streak.get(index, 0) + 1
+        self._hedge_streak[index] = streak
+        cooldown = min(self.hedge_cooldown_seconds * (2 ** (streak - 1)), 120.0)
+        until = time.monotonic() + cooldown
         if self._down_until.get(index, 0.0) < until:
             self._down_until[index] = until
 
@@ -430,6 +440,7 @@ class FallbackChatClient:
         client = self.clients[index]
         self._down_until.pop(index, None)
         self._fail_streak.pop(index, None)
+        self._hedge_streak.pop(index, None)  # 赢一次 = 恢复正常，退避清零
         if record:
             # 记忆永远挂在 clients[0] 上（history_text 也只读那一份）。
             # 写赢家就会分裂成两套上下文：切一次备用，前面聊过的事全丢。
