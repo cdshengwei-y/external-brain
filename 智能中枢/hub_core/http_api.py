@@ -9,8 +9,92 @@ from typing import Any, Dict, Optional
 from .errors import HubError, ValidationError
 from .models import TERMINAL_COMMAND_STATES
 from agent_gateway.device import VOLUME_GAINS
+from agent_gateway import host_control
 from agent_gateway.portable import PortableRequestService
 from .service import HubService
+
+
+# 桌宠本机控制页：按钮 = 语音里喊的同一批能力，动作直接在这台 Mac 上执行。
+CONTROL_PAGE_HTML = """<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>桌宠控制台</title>
+<style>
+  body { background:#0d1220; color:#e8ecf4; font-family:-apple-system,"PingFang SC",sans-serif; margin:0; padding:20px; max-width:720px; margin-inline:auto; }
+  h1 { font-size:22px; margin:0 0 4px; }
+  .sub { color:#8a94a8; font-size:13px; margin-bottom:18px; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(110px,1fr)); gap:10px; margin-bottom:18px; }
+  button.app { background:#1a2236; color:#e8ecf4; border:1px solid #2a3550; border-radius:12px; padding:14px 8px; font-size:15px; cursor:pointer; }
+  button.app:active { background:#243154; }
+  .row { display:flex; gap:8px; margin-bottom:8px; }
+  input { flex:1; background:#131a2c; color:#e8ecf4; border:1px solid #2a3550; border-radius:10px; padding:12px; font-size:15px; }
+  button.go { background:#2f6fed; color:#fff; border:none; border-radius:10px; padding:12px 22px; font-size:15px; cursor:pointer; }
+  .result { min-height:22px; color:#9fe8b8; font-size:14px; margin:10px 0 20px; }
+  .result.err { color:#ff9d9d; }
+  h2 { font-size:16px; color:#b8c2d8; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  td, th { text-align:left; padding:6px 8px; border-bottom:1px solid #1c2438; color:#c6cfdf; }
+  td.ok { color:#7fe0a0; } td.fail { color:#ff9d9d; }
+  .hint { color:#69748c; font-size:12px; margin-top:16px; line-height:1.7; }
+</style>
+</head>
+<body>
+<h1>桌宠控制台</h1>
+<div class="sub">这台 Mac 的应用开关 · 和对着桌宠说「打开WPS」走的是同一条通道</div>
+<div class="grid" id="apps"></div>
+<div class="row">
+  <input id="target" placeholder="输入应用名或网址，如 WPS / 微信 / bilibili.com" onkeydown="if(event.key==='Enter')run('open_app')">
+  <button class="go" onclick="run('open_app')">打开</button>
+  <button class="go" style="background:#556" onclick="run('quit_app')">退出</button>
+</div>
+<div class="result" id="result"></div>
+<h2>最近动作</h2>
+<table id="log"><tr><th>时间</th><th>动作</th><th>目标</th><th>结果</th></tr></table>
+<div class="hint">语音同样可用：对桌宠说「打开WPS」「打开微信」「打开bilibili.com」「退出微信」。<br>新增应用喊法：编辑 agent_gateway/host_control.py 的 APP_ALIASES 后重启中枢。</div>
+<script>
+const APPS = ["WPS","微信","企业微信","QQ","谷歌浏览器","Safari","VS Code","计算器","备忘录","飞书","百度网盘","ChatGPT","Docker","Obsidian"];
+const grid = document.getElementById('apps');
+APPS.forEach(name => {
+  const b = document.createElement('button');
+  b.className = 'app'; b.textContent = name;
+  b.onclick = () => run('open_app', name);
+  grid.appendChild(b);
+});
+async function run(action, target) {
+  const t = target || document.getElementById('target').value.trim();
+  const el = document.getElementById('result');
+  if (!t) { el.textContent = '先输入应用名或网址'; el.className = 'result err'; return; }
+  try {
+    const res = await fetch('/api/v1/host/exec', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({action, target: t})
+    });
+    const data = await res.json();
+    el.textContent = data.message || JSON.stringify(data);
+    el.className = 'result' + (data.ok ? '' : ' err');
+    loadLog();
+  } catch (e) { el.textContent = '请求失败：' + e; el.className = 'result err'; }
+}
+async function loadLog() {
+  const res = await fetch('/api/v1/host/log');
+  const data = await res.json();
+  const table = document.getElementById('log');
+  table.innerHTML = '<tr><th>时间</th><th>动作</th><th>目标</th><th>结果</th></tr>';
+  (data.actions || []).slice().reverse().forEach(a => {
+    const row = table.insertRow();
+    row.insertCell().textContent = a.ts || '';
+    row.insertCell().textContent = a.action === 'open_app' ? '打开应用' : a.action === 'quit_app' ? '退出应用' : '打开网址';
+    row.insertCell().textContent = a.target || '';
+    const c = row.insertCell(); c.textContent = a.ok ? '成功' : '失败'; c.className = a.ok ? 'ok' : 'fail';
+  });
+}
+loadLog();
+</script>
+</body>
+</html>
+"""
 
 
 def _pcm_wav_header(data_bytes: int, rate: int = 16000) -> bytes:
@@ -51,6 +135,12 @@ class HubRequestHandler(BaseHTTPRequestHandler):
         try:
             if parsed.path == "/api/v1/health":
                 self._send_json(200, self.service.health())
+                return
+            if parsed.path == "/control":
+                self._send_html(200, CONTROL_PAGE_HTML)
+                return
+            if parsed.path == "/api/v1/host/log":
+                self._send_json(200, {"actions": host_control.recent(50)})
                 return
             if parsed.path.startswith("/api/v1/portable/v1/requests/") and parsed.path.endswith("/audio"):
                 request_id = parsed.path.rstrip("/").split("/")[-2]
@@ -126,6 +216,14 @@ class HubRequestHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         parsed = urlsplit(self.path)
         try:
+            if parsed.path == "/api/v1/host/exec":
+                payload = self._read_json_body()
+                action = str(payload.get("action") or "").strip()
+                target = str(payload.get("target") or "").strip()
+                if not action or not target:
+                    raise ValidationError("action 和 target 都不能为空")
+                self._send_json(200, host_control.execute(action, target))
+                return
             if parsed.path == "/api/v1/portable/v1/media":
                 data = self._read_binary_body()
                 media = self.portable_service.upload_media(
@@ -324,6 +422,15 @@ class HubRequestHandler(BaseHTTPRequestHandler):
             return int(query.get(key, [default])[0])
         except (TypeError, ValueError):
             raise ValidationError(f"{key} 必须是整数")
+
+    def _send_html(self, status_code: int, html: str) -> None:
+        body = html.encode("utf-8")
+        self.send_response(status_code)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(body)
 
     def _send_json(self, status_code: int, payload: Any) -> None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")

@@ -18,6 +18,7 @@ from hub_core.errors import ConflictError, HubError, ValidationError
 from hub_core.service import HubService
 
 from .intent import IntentResult, IntentRouter, Plugin, PluginContext
+from . import host_control
 from .actions import build_dispatcher_from_env
 from .chat_llm import ChatLLMError
 from .device import DEFAULT_VOLUME_STEP, VOLUME_GAINS, DeviceRegistry, clamp_volume_step
@@ -200,6 +201,50 @@ class SleepPlugin(Plugin):
             intent="sleep",
             reply=intent.reply or "好，我先待命。",
             session_action="sleep",
+            source=intent.source,
+        )
+
+
+class HostControlPlugin(Plugin):
+    """本机控制：桌宠说「打开WPS」就让这台 Mac 真的去打开。
+
+    和外设插件的区别：动作执行在**中枢所在的这台电脑**上（open -a / osascript），
+    不走设备分发器。session_action 必须是 continue——固件只对 continue
+    播回复音频，未知的 action 设备会当没听见。
+    """
+
+    intents = ("app_open", "app_quit")
+
+    def __init__(self, executor: Optional[Any] = None) -> None:
+        # executor 可注入假实现做单测；默认真打 host_control
+        self._execute = executor or host_control.execute
+
+    def catalog_lines(self):
+        return [
+            '- app_open：打开/启动这台电脑上的应用或网站；slots: {"app": "应用名或网址，如 WPS、微信、bilibili.com"}',
+            '- app_quit：退出/关闭这台电脑上的应用；slots: {"app": "应用名"}',
+        ]
+
+    def handle(self, intent: IntentResult, ctx: PluginContext) -> IntentResult:
+        slots = intent.slots or {}
+        target = ""
+        for key in ("app", "target", "name", "url", "site", "website"):
+            value = str(slots.get(key) or "").strip()
+            if value:
+                target = value
+                break
+        if not target:
+            return IntentResult(
+                intent=intent.intent,
+                reply="你要打开哪个应用？说一下名字。",
+                source=intent.source,
+            )
+        action = "open_app" if intent.intent == "app_open" else "quit_app"
+        result = self._execute(action, target)
+        return IntentResult(
+            intent=intent.intent,
+            reply=str(result.get("message") or "这个操作我没做成。"),
+            session_action="continue",
             source=intent.source,
         )
 
@@ -794,6 +839,8 @@ class PortableRequestService:
             FountainPlugin(),
             MusicPlugin(),
             DevicePlugin(self.devices),
+            # 本机控制：桌宠指挥这台 Mac（打开WPS/微信/网站…）
+            HostControlPlugin(),
             # 录音豆：第一个走统一动作分发器的外设，加新外设照它抄
             RecordingBeanPlugin(dispatcher=self.action_dispatcher),
             SleepPlugin(),
