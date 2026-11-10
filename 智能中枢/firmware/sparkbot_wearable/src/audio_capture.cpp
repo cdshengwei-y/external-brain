@@ -213,10 +213,12 @@ bool configure_codec_for_adc() {
       {0x01, 0x30},
       {0x02, 0x00},
       {0x03, 0x10},
-      // 麦克风采音增益保持 0x24：2026-11-10 实测 0x28 超出 ES8311 ADC
-      // 增益寄存器合法范围（0~0x23），整条麦克风链路输出全零（peak=0）。
-      // 灵敏度改为靠降低 VAD 门限解决（kWakeVadThreshold 900→600）。
-      {0x16, 0x24},
+      // 麦克风采音增益 0x24→0x26（2026-11-10）：寄存器 0x16 高位（0x20 段）
+      // 是别的功能位，绝不能动——0x28 实测整条麦克风链路输出全零。
+      // 只抬低位增益场 4→6（约 +3dB）：正常说话音量 200~750 的峰值翻倍到
+      // 400~1500，稳过 700 的门限。若编出来 peak=0 说明低位场边界也不对，
+      // 立即回退 0x24。
+      {0x16, 0x26},
       {0x04, 0x10},
       {0x05, 0x00},
       {0x0B, 0x00},
@@ -340,10 +342,12 @@ bool configure_codec_for_playback() {
       {0x01, 0x30},
       {0x02, 0x00},
       {0x03, 0x10},
-      // 麦克风采音增益保持 0x24：2026-11-10 实测 0x28 超出 ES8311 ADC
-      // 增益寄存器合法范围（0~0x23），整条麦克风链路输出全零（peak=0）。
-      // 灵敏度改为靠降低 VAD 门限解决（kWakeVadThreshold 900→600）。
-      {0x16, 0x24},
+      // 麦克风采音增益 0x24→0x26（2026-11-10）：寄存器 0x16 高位（0x20 段）
+      // 是别的功能位，绝不能动——0x28 实测整条麦克风链路输出全零。
+      // 只抬低位增益场 4→6（约 +3dB）：正常说话音量 200~750 的峰值翻倍到
+      // 400~1500，稳过 700 的门限。若编出来 peak=0 说明低位场边界也不对，
+      // 立即回退 0x24。
+      {0x16, 0x26},
       {0x04, 0x10},
       {0x05, 0x00},
       {0x0B, 0x00},
@@ -2032,22 +2036,12 @@ bool wait_for_wake_word() {
     if (!capture_until_silence(4, kWakeVadSilenceChunks, kWakeVadThreshold, 3)) {
       continue;
     }
-    // 连锁指令修复（2026-11-10 现场）：「贾维斯打开计算器」的最响簇就是
-    // 唤醒词本身，一裁整条命令只剩「加维斯。」——中枢只能回「我在」，
-    // 命令部分在上传前就丢了（用户症状：只唤醒、不做事）。
-    // 所以短录音（≤2.8s，喊醒+一句短指令正好在这范围）整段上传不裁；
-    // 超过 2.8s 的才是房间正常聊天，裁到最响簇（多半不是唤醒词）→
-    // ASR 未命中 → 留在待机，不会把聊天当指令。
-    constexpr size_t kWakeMaxUploadFrames =
-        static_cast<size_t>(kSampleRate) * 28 / 10;  // 2.8s
-    if (wav_frames > kWakeMaxUploadFrames) {
-      trim_wav_to_loudest_span();
-      if (wav_frames > kWakeMaxUploadFrames) {
-        Serial.printf("[VAD] wake skip: %.2fs candidate too long (room speech)\n",
-                      static_cast<double>(wav_frames) / kSampleRate);
-        continue;
-      }
-    }
+    // 连锁指令（2026-11-10 第三版）：凡是捕获到的候选一律整段上传。
+    // 「贾维斯打开计算器」实测 2.9~3.4s——之前 2.8s 的上限把这些整句
+    // 全部当成「房间聊天」跳过了，用户症状就是「只唤醒不做事」甚至
+    // 「完全没反应」。窗口本身只有 4s（capture_until_silence 的
+    // max_seconds），上传也就 ≤128KB ≈ 1s，可以接受；房间聊天的误上传
+    // 由中枢 ASR + 门控过滤（未命中只白花一次校验，设备黑屏无感）。
     if (!submit_captured_wav_to_hub("wake", kWakePollIntervalMs, false)) {
       Serial.println("[VOICE] wake request failed; retry in 2s");
       delay(2000);
