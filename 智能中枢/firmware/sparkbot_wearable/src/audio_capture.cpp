@@ -2025,19 +2025,21 @@ bool wait_for_wake_word() {
     if (!capture_until_silence(4, kWakeVadSilenceChunks, kWakeVadThreshold, 3)) {
       continue;
     }
-    // 只传最响的一簇：94252 字节 → 30KB 上下，上传少花 0.5~0.8 秒，
-    // 送到 ASR 的音频也更干净。
-    trim_wav_to_loudest_span();
-    // 裁剪后还超过 2.8 秒的候选基本是房间里正常说话（多短句聊天）：
-    // 「贾维斯」单独喊约 1 秒，「贾维斯+一句短指令」也在 2.5 秒以内。
-    // 这种候选上传只会换来一次「未命中」，期间设备等中枢回话要聋 1 秒多，
-    // 正好把你真正的喊声漏掉 —— 直接留在本地不传。
+    // 连锁指令修复（2026-11-10 现场）：「贾维斯打开计算器」的最响簇就是
+    // 唤醒词本身，一裁整条命令只剩「加维斯。」——中枢只能回「我在」，
+    // 命令部分在上传前就丢了（用户症状：只唤醒、不做事）。
+    // 所以短录音（≤2.8s，喊醒+一句短指令正好在这范围）整段上传不裁；
+    // 超过 2.8s 的才是房间正常聊天，裁到最响簇（多半不是唤醒词）→
+    // ASR 未命中 → 留在待机，不会把聊天当指令。
     constexpr size_t kWakeMaxUploadFrames =
         static_cast<size_t>(kSampleRate) * 28 / 10;  // 2.8s
     if (wav_frames > kWakeMaxUploadFrames) {
-      Serial.printf("[VAD] wake skip: %.2fs candidate too long (room speech)\n",
-                    static_cast<double>(wav_frames) / kSampleRate);
-      continue;
+      trim_wav_to_loudest_span();
+      if (wav_frames > kWakeMaxUploadFrames) {
+        Serial.printf("[VAD] wake skip: %.2fs candidate too long (room speech)\n",
+                      static_cast<double>(wav_frames) / kSampleRate);
+        continue;
+      }
     }
     if (!submit_captured_wav_to_hub("wake", kWakePollIntervalMs, false)) {
       Serial.println("[VOICE] wake request failed; retry in 2s");
