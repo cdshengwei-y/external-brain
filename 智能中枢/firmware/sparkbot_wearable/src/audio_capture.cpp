@@ -8,9 +8,11 @@
 #include <driver/i2s.h>
 #include <esp32-hal-psram.h>
 #include <esp_err.h>
+#include <esp_system.h>
 #include <math.h>
 
 #include "board_config.h"
+#include "wake_sleep_phrases.h"
 #include "wozai_audio.h"
 
 #ifdef PET_FOUNTAIN
@@ -800,14 +802,22 @@ void enter_face_state() {
 // 待机态：熄屏。只有在这个状态下才需要唤醒词。
 // show_sleepy=false 用于上电直进待机：不画「闭眼睡着」、不留 350ms，
 // 从上电起全程黑屏（对话结束回落待机时仍用默认 true，保留闭眼过渡）。
+void play_sleep_phrase();  // 熄屏前的随机结束语（定义在播放区，这里前置声明）
+
 void enter_standby_state(bool show_sleepy = true) {
+  if (show_sleepy) {
+    if (fountain::active()) {
+      // 喷泉还在跳：先说结束语再关喷泉 —— 关掉后功放（=背光 GPIO46）没电，说了也是哑的
+      play_sleep_phrase();
+    } else {
+      face::set_expression(face::kSleepy);
+      face::tick();
+      delay(350);  // 让「闭眼睡着」露一下再熄屏，否则看起来像被粗暴关掉
+      play_sleep_phrase();  // 随机结束语，说完才熄屏
+    }
+  }
   if (fountain::active()) {
     fountain::set_active(false);
-  }
-  if (show_sleepy) {
-    face::set_expression(face::kSleepy);
-    face::tick();
-    delay(350);  // 让「闭眼睡着」露一下再熄屏，否则看起来像被粗暴关掉
   }
   face::suspend();
   set_display_and_amp(false);
@@ -815,36 +825,38 @@ void enter_standby_state(bool show_sleepy = true) {
 }
 #endif  // PET_FOUNTAIN
 
-void play_wakeup_audio() {
+// 唤醒播报拆成两段（2026-11-10 音画同步）：
+//   prepare_wakeup_playback()  —— 黑屏期间就把 TX 通路备好（重装 I2S、配 codec），
+//                                 这些动作要几百毫秒，以前表情挂在亮着的屏幕上干等；
+//   play_wakeup_audio_prepared() —— 开功放 + 上说话嘴型 + 立即出声。
+// 顺序必须是「先备通路 → 亮屏 → 出声」：功放和背光共用 GPIO46，
+// 黑屏里出声就是哑的；备好之后亮屏与出声只隔一个 delay(20)，肉眼即同步。
+bool prepare_wakeup_playback() {
   // 待机时 I2S 是常开的 RX 模式，切 TX 必须重装驱动（start_i2s 对已启动直接返回）
   stop_i2s();
   codec_adc_ready = false;
   if (!start_i2s(I2S_MODE_TX)) {
-    return;
+    return false;
   }
   if (!configure_codec_for_playback()) {
     Serial.println("[AUDIO] ES8311 playback configuration failed; stopping I2S");
     stop_i2s();
-    return;
+    return false;
   }
+  return true;
+}
 
-  digitalWrite(kPowerAmpEnablePin, HIGH);
-  Serial.println("[AUDIO] PA GPIO46 enabled");
-  delay(20);
-#ifdef PET_FOUNTAIN
-  face::set_expression(face::kSpeaking);
-#endif
-
+// 按 chunk 把一段裸 PCM 推给 I2S；drive_mouth=true 时嘴型随音量张合
+void play_pcm_clip(const unsigned char* pcm_data, unsigned int pcm_len, bool drive_mouth) {
   constexpr size_t kMonoChunkSamples = 1024;
   int16_t mono_buffer[kMonoChunkSamples];
-  const int16_t* pcm_samples =
-      reinterpret_cast<const int16_t*>(_tmp_sparkbot_wozai_20261106_pcm);
+  const int16_t* pcm_samples = reinterpret_cast<const int16_t*>(pcm_data);
   size_t offset = 0;
   uint32_t chunk_index = 0;
   bool write_failed = false;
-  while (offset < _tmp_sparkbot_wozai_20261106_pcm_len / sizeof(int16_t)) {
+  while (offset < pcm_len / sizeof(int16_t)) {
     const size_t remaining =
-        _tmp_sparkbot_wozai_20261106_pcm_len / sizeof(int16_t) - offset;
+        pcm_len / sizeof(int16_t) - offset;
     const size_t samples = min(remaining, kMonoChunkSamples);
     int32_t chunk_peak = 0;
     for (size_t index = 0; index < samples; ++index) {
@@ -867,9 +879,11 @@ void play_wakeup_audio() {
       break;
     }
 #ifdef PET_FOUNTAIN
-    face::feed_amp(chunk_peak / 32768.0f * 3.2f);
-    if ((chunk_index & 1u) == 0u) {
-      face::tick();
+    if (drive_mouth) {
+      face::feed_amp(chunk_peak / 32768.0f * 3.2f);
+      if ((chunk_index & 1u) == 0u) {
+        face::tick();
+      }
     }
 #endif
     ++chunk_index;
@@ -886,6 +900,38 @@ void play_wakeup_audio() {
   if (!write_failed) {
     Serial.println("[AUDIO] playback completed");
   }
+}
+
+// 唤醒应答：随机抽一条招呼语（2026-11-10 用户要求多样，不再永远是「我在」）
+void play_wakeup_audio_prepared() {
+  digitalWrite(kPowerAmpEnablePin, HIGH);
+  Serial.println("[AUDIO] PA GPIO46 enabled");
+  delay(20);
+#ifdef PET_FOUNTAIN
+  face::set_expression(face::kSpeaking);
+  face::tick();  // 说话嘴型先挂上，feed_amp 会随音量张合
+#endif
+  const PetPhraseClip& clip = PET_WAKE_PHRASES[esp_random() % PET_WAKE_PHRASE_COUNT];
+  play_pcm_clip(clip.data, clip.len, true);
+}
+
+// 熄屏前的结束语：闭眼挂着说一句，说完才真正熄屏（也是随机多样）
+void play_sleep_phrase() {
+  if (!prepare_wakeup_playback()) {
+    return;  // 备通路失败就静默入睡，别为一句告别卡住休眠
+  }
+  digitalWrite(kPowerAmpEnablePin, HIGH);
+  delay(20);
+  const PetPhraseClip& clip = PET_SLEEP_PHRASES[esp_random() % PET_SLEEP_PHRASE_COUNT];
+  play_pcm_clip(clip.data, clip.len, false);
+}
+
+void play_wakeup_audio() {
+  // 串口 p 命令等非唤醒场景用：备通路 + 出声一次做完（无屏幕同步诉求）
+  if (!prepare_wakeup_playback()) {
+    return;
+  }
+  play_wakeup_audio_prepared();
 }
 
 void play_test_tone() {
@@ -1718,13 +1764,19 @@ void wait_for_audio_request(
       const bool finished = state == "completed" || state == "succeeded";
       if (finished && session_action == "awake") {
 #ifdef PET_FOUNTAIN
-        // 待机时屏幕是熄的，先点亮并挂上表情，再播「我在」，
-        // 否则回复会被憋在没有背光（也没有功放供电）的黑屏里。
+        // 音画同步（2026-11-10）：黑屏期间先把 TX 通路备好，然后亮屏
+        // （= 功放供电）与「我在」出声同一瞬间发生，表情直接上说话嘴型。
+        // 顺序不能反：功放和背光共用 GPIO46，黑屏里出声是哑的。
+        const bool playback_ready = prepare_wakeup_playback();
         enter_face_state();
-        face::set_expression(face::kHappy);
+        face::set_expression(face::kSpeaking);
         face::tick();
-#endif
+        if (playback_ready) {
+          play_wakeup_audio_prepared();
+        }
+#else
         play_wakeup_audio();
+#endif
       } else if (finished && (session_action == "fountain_start" ||
                               session_action == "fountain_stop")) {
         // 先播 TTS 确认，再开关喷泉：说话时不跳，说完立刻开始跳
@@ -1906,16 +1958,24 @@ void upload_wav_to_hub(const char* session_mode = "conversation") {
 
 // 表情态：亮屏、持续聆听。说的话直接送中枢（聊天 / 搜索 / 动手都行），
 // 不需要唤醒词——屏幕上那张脸本身就是「我在」。
-// 返回 true = 听到「退下吧」，该熄屏待命了；false = 被串口打断。
+// 返回 true = 该熄屏待命了（「退下吧」或空闲超时）；false = 被串口打断。
+// 空闲 45s 自动回休眠（2026-11-10）：中枢的会话窗口也只有 45s，醒着超过
+// 它之后说的话会被中枢当环境音忽略（白醒），所以设备必须在窗口内自己回去。
 bool converse_with_face() {
+  constexpr unsigned long kIdleSleepMs = 45000;
 #ifdef PET_FOUNTAIN
   enter_face_state();
 #endif
   Serial.println("[VOICE] listening; say 退下吧 to sleep");
+  unsigned long last_activity_ms = millis();
   while (true) {
     if (Serial.available() > 0) {
       Serial.println("[VOICE] conversation interrupted by serial input");
       return false;
+    }
+    if (millis() - last_activity_ms >= kIdleSleepMs) {
+      Serial.println("[VOICE] idle 45s; back to standby");
+      return true;  // 由 run_voice_conversation 统一走 enter_standby_state（闭眼过渡）
     }
     // 上一轮回复的尾音还在屋里回荡，先留静默窗口再清 DMA，
     // 否则会把自己的尾音当成下一句，形成自问自答的死循环。
@@ -1927,8 +1987,9 @@ bool converse_with_face() {
     // 对话态多要一块连续过门限（3 块 = 192ms）：房间里的咳嗽、清嗓子
     // 会被挡在本地，不再白传一次 ASR、也不再让表情屏闪一下思考脸。
     if (!capture_until_silence(8, kVadSilenceChunks, kVadThreshold, 0, 3)) {
-      continue;
+      continue;  // 没说话：idle 计时不重置，攒够 45s 就回去睡
     }
+    last_activity_ms = millis();  // 有人说话了，空闲计时从这重新起算
     // 砍掉句首空等 + 峰值归一化，否则 8 秒窗口里可能 4 秒都是底噪，
     // 且人声电平只有 -30 dBFS，ASR 认不出来只能瞎猜。
     trim_capture_to_speech_onset();
