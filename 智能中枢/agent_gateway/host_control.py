@@ -247,6 +247,10 @@ def _resolve_app_target(fragment: str) -> Optional[str]:
     segments = [fragment] + re.split(r"[，,。.、！!？?；;：:\s]+", fragment)
     for segment in segments:
         candidate = segment.strip()
+        # 首尾填充词都剥：「查一下微信」的「一下」在头，「计算器吧」的吧在尾
+        for filler in ("一下", "一个", "个", "吧"):
+            while candidate.startswith(filler):
+                candidate = candidate[len(filler):].strip()
         for tail in ("一下", "了", "吧", "呗", "它"):
             while candidate.endswith(tail):
                 candidate = candidate[: -len(tail)].strip()
