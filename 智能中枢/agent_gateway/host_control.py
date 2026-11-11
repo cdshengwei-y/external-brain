@@ -232,7 +232,7 @@ def execute(action: str, target: str) -> Dict[str, Any]:
 
 _OPEN_WORDS = ("打开", "开启", "启动", "运行", "开一下", "开个")
 _QUIT_WORDS = ("退出", "关闭", "关掉", "退掉", "停掉")
-_PREFIX_WORDS = ("麻烦你", "麻烦", "请你", "帮我", "给我", "请")
+_PREFIX_WORDS = ("麻烦你", "你给我", "你帮", "叫你", "麻烦", "请你", "帮我", "给我", "请")
 # 这些目标不是这台 Mac 的事（喷泉/放歌归设备，灯/空调归外设），别抢
 _NON_HOST_MARKS = ("喷泉", "音乐", "歌", "灯", "空调", "电视", "录音", "豆")
 
@@ -243,7 +243,21 @@ def parse_voice_command(text: str) -> Optional[tuple]:
     返回 (action, target) 或 None（不是本机指令 / 目标不在白名单）。
     """
     cleaned = str(text or "").strip()
+    cleaned = cleaned.strip("。.！!？?，,、~～…—-·\"'“”‘’ ")
     if not cleaned:
+        return None
+    # 「把微信打开」这类倒装：目标在前、动词在后
+    inversion = re.match(
+        r"^(?:帮我把|给我把|你给我把|叫你把|把|将)(.+?)(打开|开启|启动|退出|关闭|关掉)[了吧]?$",
+        cleaned,
+    )
+    if inversion:
+        target = inversion.group(1).strip()
+        action = (
+            "open_app" if inversion.group(2) in ("打开", "开启", "启动") else "quit_app"
+        )
+        if _normalize(target) in APP_ALIASES or looks_like_url(target):
+            return (action, target)
         return None
     for prefix in _PREFIX_WORDS:
         if cleaned.startswith(prefix):
