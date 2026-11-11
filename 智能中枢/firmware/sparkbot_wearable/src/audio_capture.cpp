@@ -1145,30 +1145,13 @@ bool trim_wav_to_loudest_span() {
 // 那套 50ms 的 gap 容差会把后半句直接切掉，所以这里只按 VAD 给出的起点裁。
 // 顺带做峰值归一化：麦克风 PGA 只有 24 dB，实测人声峰值常年在 -30 dBFS 附近，
 // ASR 在这个电平上会幻听，抬到 0.7 满量程后才稳定。
-bool trim_capture_to_speech_onset() {
-  constexpr size_t kPadHeadFrames = kSampleRate / 5;  // 句首留 0.2s，保住声母
+// 峰值归一化到 0.7 满量程（只放大不衰减）。会话裁剪与流式唤醒探针共用：
+// 麦克风 PGA 只有 24 dB，实测人声峰值常年在 -30 dBFS 附近，ASR 在这个
+// 电平上会幻听，抬到 0.7 满量程后才稳定。
+void normalize_capture_peak() {
   if (wav_mono_buffer == nullptr || wav_frames == 0) {
-    return false;
+    return;
   }
-  size_t start = speech_onset_frames;
-  if (start > kPadHeadFrames) {
-    start -= kPadHeadFrames;
-  } else {
-    start = 0;
-  }
-  // 裁完不足 100ms 说明切错了，宁可整段原样送出去
-  if (start + kSampleRate / 10 >= wav_frames) {
-    Serial.println("[VAD] conversation trim skipped (too short after onset)");
-    return false;
-  }
-  const size_t before_frames = wav_frames;
-  if (start > 0) {
-    memmove(wav_mono_buffer,
-            wav_mono_buffer + start,
-            (wav_frames - start) * sizeof(int16_t));
-    wav_frames -= start;
-  }
-
   uint32_t peak = 0;
   for (size_t index = 0; index < wav_frames; ++index) {
     const int32_t value = wav_mono_buffer[index];
@@ -1193,14 +1176,40 @@ bool trim_capture_to_speech_onset() {
       }
     }
   }
+}
+
+bool trim_capture_to_speech_onset() {
+  constexpr size_t kPadHeadFrames = kSampleRate / 5;  // 句首留 0.2s，保住声母
+  if (wav_mono_buffer == nullptr || wav_frames == 0) {
+    return false;
+  }
+  size_t start = speech_onset_frames;
+  if (start > kPadHeadFrames) {
+    start -= kPadHeadFrames;
+  } else {
+    start = 0;
+  }
+  // 裁完不足 100ms 说明切错了，宁可整段原样送出去
+  if (start + kSampleRate / 10 >= wav_frames) {
+    Serial.println("[VAD] conversation trim skipped (too short after onset)");
+    return false;
+  }
+  const size_t before_frames = wav_frames;
+  if (start > 0) {
+    memmove(wav_mono_buffer,
+            wav_mono_buffer + start,
+            (wav_frames - start) * sizeof(int16_t));
+    wav_frames -= start;
+  }
+
+  normalize_capture_peak();
   Serial.printf(
-      "[VAD] conversation trim: %u -> %u frames (%.2fs -> %.2fs), peak=%lu, "
+      "[VAD] conversation trim: %u -> %u frames (%.2fs -> %.2fs), "
       "onset=%.2fs\n",
       static_cast<unsigned int>(before_frames),
       static_cast<unsigned int>(wav_frames),
       static_cast<double>(before_frames) / kSampleRate,
       static_cast<double>(wav_frames) / kSampleRate,
-      static_cast<unsigned long>(peak),
       static_cast<double>(speech_onset_frames) / kSampleRate);
   return true;
 }
@@ -2066,6 +2075,10 @@ bool wait_for_wake_word() {
     // 「完全没反应」。窗口本身只有 4s（capture_until_silence 的
     // max_seconds），上传也就 ≤128KB ≈ 1s，可以接受；房间聊天的误上传
     // 由中枢 ASR + 门控过滤（未命中只白花一次校验，设备黑屏无感）。
+    // 峰值归一化（2026-11-11）：探针音频不做归一化就会以 -23dBFS 的原始
+    // 微弱电平上传，SenseVoice 只能猜出「嗯」「I.」——会话路径一直都有
+    // 这一步，唤醒探针此前漏了。归一化后所有探针都以一致电平进识别。
+    normalize_capture_peak();
     if (!submit_captured_wav_to_hub("wake", kWakePollIntervalMs, false)) {
       Serial.println("[VOICE] wake request failed; retry in 2s");
       delay(2000);
