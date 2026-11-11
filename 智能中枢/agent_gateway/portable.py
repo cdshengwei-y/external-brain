@@ -1784,6 +1784,24 @@ class PortableRequestService:
         level_note = describe_audio_level(payload_bytes)
         if level_note:
             print(f"[MIC] {level_note} {tag}".rstrip(), flush=True)
+        # 本地离线识别优先（2026-11-11）：153 远程 ASR 服务端解码后端挂了
+        # （NoBackendError，对已知清晰样本稳定 500），而且不是报错而是吐
+        # 幻觉文本「嗯」，会污染语音门控和唤醒判定。本机 paraformer 模型
+        # （~/.cache/sherpa-asr/）缺文件时才回退远程。
+        try:
+            from agent_gateway import local_asr
+
+            if local_asr.is_available():
+                local_started = time.perf_counter()
+                local_text = local_asr.transcribe_wav(payload_bytes)
+                print(
+                    f"[TIMING] asr-local={(time.perf_counter() - local_started) * 1000:.0f}ms "
+                    f"text={local_text!r} {tag}".rstrip(),
+                    flush=True,
+                )
+                return local_text
+        except Exception as error:  # noqa: BLE001 - 本地失败回退远程，不能因此断链路
+            print(f"[ASR] 本地识别异常，回退远程：{error}", flush=True)
         try:
             response = provider.transcribe(audio_data_url)
         except Exception as error:
