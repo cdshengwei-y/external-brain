@@ -438,10 +438,10 @@ bool start_i2s(i2s_mode_t direction) {
       // 4×256 只有 32ms 的缓冲，播放时每写一块还要画一次屏（240×190×2 走 40MHz SPI
       // 约 18ms），DMA 必然被抽干，声音就变成卡顿、重复的「鬼畜」音。
       // 扩到 16×256 ≈ 128ms 给 CPU 留出余量。
-      // 2026-11-11 再扩到 48×256 ≈ 768ms：流式唤醒探针上传期间（约 0.3~0.5s）
-      // 用户还在说命令，16 档缓冲装不下会溢出丢字——加大后话尾由会话态
-      // 第一轮从 DMA 无缝读走。
-      .dma_buf_count = 48,
+      // 2026-11-11 三扩到 64×256 ≈ 1s：实时字幕模式里上传+识别的空档期
+      // 用户还在连续说话，这段音频全压在 DMA 环形缓冲里，ring 比空档短就
+      // 溢出丢词（用户实测「丢词有点严重」）。64 档 = 内部 RAM 再 +16KB。
+      .dma_buf_count = 64,
       .dma_buf_len = 256,
       .use_apll = true,
       // 欠载（DMA 被抽干）时一定要输出静音，不能让它循环重播最后一段缓冲。
@@ -2059,6 +2059,7 @@ bool submit_live_chunk(String& transcript, bool& sleep_now) {
   transcript = "";
   sleep_now = false;
   build_wav_file();
+  const unsigned long gap_started = millis();  // 空档起点：本段采集结束→下段开始
   if (!connect_wifi_for_upload()) {
     return false;
   }
@@ -2066,6 +2067,7 @@ bool submit_live_chunk(String& transcript, bool& sleep_now) {
   if (!post_audio_to_hub(media_id)) {
     return false;
   }
+  const unsigned long upload_ms = millis() - gap_started;
   String request_id;
   if (!submit_audio_request(media_id, "live", request_id)) {
     return false;
@@ -2095,9 +2097,13 @@ bool submit_live_chunk(String& transcript, bool& sleep_now) {
       transcript = document["transcript"].as<String>();
       sleep_now = document["session_action"].as<String>() == "sleep";
       fetch_and_draw_live_frame(request_id);
+      // 空档 = 上传+提交+轮询到 completed 的总时长；DMA ring 只有 1s，
+      // 空档超过 1s 的部分就是丢词量——这条日志用来核对 ring 够不够。
+      Serial.printf("[LIVE] gap=%lums (upload=%lums) transcript=%s\n",
+                    millis() - gap_started, upload_ms, transcript.c_str());
       return true;
     }
-    delay(150);
+    delay(100);
   }
   Serial.println("[LIVE] request polling timed out");
   return false;
@@ -2119,18 +2125,16 @@ bool run_live_transcription() {
       Serial.println("[LIVE] interrupted by serial input");
       return false;
     }
-    // 本机不播音（字幕模式没有 TTS），不存在自问自答，每轮直接清 DMA 收新的
-    if (i2s_started) {
-      i2s_zero_dma_buffer(kI2sPort);
-    }
     last_session_action = "";
-    // 每段最多 3 秒、尾音 4 块（256ms）就收——字幕要的是快，长句被拆成
-    // 多段没关系，中枢按顺序折行显示，写满 16 行回卷覆盖最旧的。
-    // 门限用待机档 500：字幕屏的场景就是「凑着麦说话」，宁可多传不漏字。
-    if (!capture_until_silence(3, 4, kWakeVadThreshold, 0, 2)) {
+    // 丢词修复（2026-11-11）：上传+识别的约 1s 空档里用户还在说话，这段
+    // 音频压在 DMA 环形缓冲（64×256 帧 ≈ 1s）里。绝不能清缓冲——清了
+    // 空档期说的整段蒸发（实测症状：句子中段缺失）。clear_dma=false 让
+    // 下一轮从 ring 无缝续读；长句超 4s 被切段时尾巴同样由下一轮接走。
+    if (!capture_until_silence(4, 4, kWakeVadThreshold, 0, 2, 0, false)) {
       continue;  // 没人说话：继续听，屏幕保持常亮
     }
-    normalize_capture_peak();
+    // 裁掉轮首静音（留 0.2s 句首保护垫防声母被切），trim 内部顺带做峰值归一化
+    trim_capture_to_speech_onset();
     String transcript;
     bool clear_screen = false;
     if (!submit_live_chunk(transcript, clear_screen)) {
