@@ -24,11 +24,14 @@ import wave
 from pathlib import Path
 from typing import Optional
 
-# 模型目录：默认 ~/.cache/sherpa-asr/<模型名>，可用环境变量覆盖
+# 模型目录：默认 ~/.cache/sherpa-asr/<模型名>，可用环境变量覆盖。
+# 优先 SenseVoice（对中文短句/噪声更鲁棒），缺文件时退回 paraformer-small。
+_SENSE_VOICE_DIR = Path.home() / ".cache/sherpa-asr/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17"
 DEFAULT_MODEL_DIR = Path.home() / ".cache/sherpa-asr/sherpa-onnx-paraformer-zh-small-2024-03-09"
 MODEL_DIR_ENV = "LOCAL_ASR_MODEL_DIR"
 
 _recognizer = None  # 进程内单例：模型加载约 1~2s，只做一次
+_loaded_kind: Optional[str] = None  # "sense-voice" / "paraformer"
 
 
 def model_dir() -> Optional[Path]:
@@ -37,9 +40,18 @@ def model_dir() -> Optional[Path]:
     explicit = os.environ.get(MODEL_DIR_ENV)
     if explicit and Path(explicit).is_dir():
         return Path(explicit)
-    if DEFAULT_MODEL_DIR.is_dir():
+    if (_SENSE_VOICE_DIR / "model.int8.onnx").is_file():
+        return _SENSE_VOICE_DIR
+    if (DEFAULT_MODEL_DIR / "model.int8.onnx").is_file():
         return DEFAULT_MODEL_DIR
     return None
+
+
+def model_kind() -> Optional[str]:
+    directory = model_dir()
+    if directory is None:
+        return None
+    return "sense-voice" if directory == _SENSE_VOICE_DIR else "paraformer"
 
 
 def is_available() -> bool:
@@ -53,7 +65,7 @@ def is_available() -> bool:
 
 
 def _get_recognizer():
-    global _recognizer
+    global _recognizer, _loaded_kind
     if _recognizer is not None:
         return _recognizer
     import sherpa_onnx
@@ -62,11 +74,22 @@ def _get_recognizer():
     if directory is None:
         raise RuntimeError("本地 ASR 模型目录不存在")
     # sherpa_onnx 2.0.1：构造器改为按模型的 from_xxx 工厂方法
-    _recognizer = sherpa_onnx.OfflineRecognizer.from_paraformer(
-        paraformer=str(directory / "model.int8.onnx"),
-        tokens=str(directory / "tokens.txt"),
-        num_threads=2,
-    )
+    if directory == _SENSE_VOICE_DIR:
+        _recognizer = sherpa_onnx.OfflineRecognizer.from_sense_voice(
+            model=str(directory / "model.int8.onnx"),
+            tokens=str(directory / "tokens.txt"),
+            num_threads=2,
+            use_itn=True,  # 数字直接出阿拉伯数字，「现在几点」回复更好念
+        )
+        _loaded_kind = "sense-voice"
+    else:
+        _recognizer = sherpa_onnx.OfflineRecognizer.from_paraformer(
+            paraformer=str(directory / "model.int8.onnx"),
+            tokens=str(directory / "tokens.txt"),
+            num_threads=2,
+        )
+        _loaded_kind = "paraformer"
+    return _recognizer
     return _recognizer
 
 
