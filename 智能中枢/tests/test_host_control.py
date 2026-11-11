@@ -155,5 +155,22 @@ class ParseVoiceCommandTests(unittest.TestCase):
         self.assertIsNone(self.parse("你好"))
 
 
+    def test_garbled_prefixes_from_real_asr(self):
+        # 2026-11-11 现场实测：识别结果带乱码前缀和重复，也要能解析
+        self.assertEqual(self.parse("打儿子打开微信。"), ("open_app", "微信"))
+        self.assertEqual(self.parse("叫你打开微信。"), ("open_app", "微信"))
+        self.assertEqual(
+            self.parse("打开计算器吧，打开计算机。"), ("open_app", "计算器")
+        )
+        self.assertEqual(self.parse("价维斯打开wps。"), ("open_app", "wps"))
+
+    def test_safety_still_holds_with_anywhere_verbs(self):
+        # 动词任意位置匹配后，安全护栏必须仍然有效
+        self.assertIsNone(self.parse("他打开了淘宝"))  # 淘宝不在白名单
+        self.assertIsNone(self.parse("打开音乐"))  # 音乐归设备
+        self.assertIsNone(self.parse("我的心打开了"))  # 动词后没有目标
+        self.assertIsNone(self.parse("打开我的心"))  # ASR 抖动防误触
+
+
 if __name__ == "__main__":
     unittest.main()

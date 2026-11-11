@@ -237,58 +237,77 @@ _PREFIX_WORDS = ("麻烦你", "你给我", "你帮", "叫你", "麻烦", "请你
 _NON_HOST_MARKS = ("喷泉", "音乐", "歌", "灯", "空调", "电视", "录音", "豆")
 
 
+def _resolve_app_target(fragment: str) -> Optional[str]:
+    """从动词后的片段里解析出白名单内的应用名。
+
+    整段不行就按标点/空白分段逐段试（识别结果常是「计算器吧，打开计算机」
+    这种带重复和语气词的混体），段内再剥语气词。喷泉/音乐/灯等非本机目标
+    返回 None 交给对应通道。
+    """
+    segments = [fragment] + re.split(r"[，,。.、！!？?；;：:\s]+", fragment)
+    for segment in segments:
+        candidate = segment.strip()
+        for tail in ("一下", "了", "吧", "呗", "它"):
+            while candidate.endswith(tail):
+                candidate = candidate[: -len(tail)].strip()
+        if not candidate:
+            continue
+        if any(mark in candidate for mark in _NON_HOST_MARKS):
+            return None  # 喷泉/音乐/灯……不是本机的事
+        if _normalize(candidate) in APP_ALIASES or looks_like_url(candidate):
+            return candidate
+    return None
+
+
 def parse_voice_command(text: str) -> Optional[tuple]:
     """从一句语音文本里解析出本机控制指令。
 
     返回 (action, target) 或 None（不是本机指令 / 目标不在白名单）。
+
+    实测识别结果常带乱码前缀和重复（「打儿子打开微信。」「打开计算器吧，
+    打开计算机。」），所以动词允许出现在句中任意位置，从最后一个出现处
+    往前逐个尝试；目标解析交给 ``_resolve_app_target`` 分段容错。
     """
-    cleaned = str(text or "").strip()
-    cleaned = cleaned.strip("。.！!？?，,、~～…—-·\"'“”‘’ ")
-    if not cleaned:
+    raw = str(text or "").strip()
+    raw = raw.strip("。.！!？?，,、~～…—-·\"'“”‘’ ")
+    if not raw:
         return None
+
     # 「把微信打开」这类倒装：目标在前、动词在后
     inversion = re.match(
         r"^(?:帮我把|给我把|你给我把|叫你把|把|将)(.+?)(打开|开启|启动|退出|关闭|关掉)[了吧]?$",
-        cleaned,
+        raw,
     )
     if inversion:
         target = inversion.group(1).strip()
         action = (
             "open_app" if inversion.group(2) in ("打开", "开启", "启动") else "quit_app"
         )
-        if _normalize(target) in APP_ALIASES or looks_like_url(target):
-            return (action, target)
+        resolved = _resolve_app_target(target)
+        if resolved is not None:
+            return (action, resolved)
         return None
-    for prefix in _PREFIX_WORDS:
-        if cleaned.startswith(prefix):
-            cleaned = cleaned[len(prefix):].strip()
-    action = None
-    for word in _OPEN_WORDS:
-        if cleaned.startswith(word):
-            action, cleaned = "open_app", cleaned[len(word):].strip()
-            break
-    if action is None:
-        for word in _QUIT_WORDS:
-            if cleaned.startswith(word):
-                action, cleaned = "quit_app", cleaned[len(word):].strip()
+
+    # 收集所有动词出现位置（含跨词重叠，如「大打开」里的「打开」）
+    occurrences: List[tuple] = []
+    for word, action in [(w, "open_app") for w in _OPEN_WORDS] + [
+        (w, "quit_app") for w in _QUIT_WORDS
+    ]:
+        start = 0
+        while True:
+            pos = raw.find(word, start)
+            if pos < 0:
                 break
-    if action is None:
+            occurrences.append((pos, len(word), action, word))
+            start = pos + 1
+    if not occurrences:
         return None
-    # 去动词后的填充词（「打开一下微信」）和尾部语气词（「打开WPS了」）
-    for filler in ("一下", "一个", "个", "吧"):
-        while cleaned.startswith(filler):
-            cleaned = cleaned[len(filler):].strip()
-    for tail in ("一下", "了", "吧", "呗", "它"):
-        while cleaned.endswith(tail):
-            cleaned = cleaned[: -len(tail)].strip()
-    if not cleaned:
-        return None
-    if any(mark in cleaned for mark in _NON_HOST_MARKS):
-        return None  # 喷泉/音乐/灯……不是本机的事，交给对应通道
-    known = _normalize(cleaned) in APP_ALIASES or looks_like_url(cleaned)
-    if not known:
-        return None  # 白名单外：宁可慢一点也不乱开
-    return (action, cleaned)
+    # 从最后出现的动词往前试（用户重复命令时最后一句是最新意图）
+    for pos, vlen, action, _word in sorted(occurrences, reverse=True):
+        target = _resolve_app_target(raw[pos + vlen:])
+        if target is not None:
+            return (action, target)
+    return None
 
 
 def recent(count: int = 20) -> List[Dict[str, Any]]:
