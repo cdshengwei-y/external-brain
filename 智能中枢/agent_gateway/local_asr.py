@@ -19,6 +19,7 @@
 
 from __future__ import annotations
 
+import math
 import struct
 import wave
 from pathlib import Path
@@ -101,22 +102,25 @@ def _get_recognizer():
 def transcribe_pcm(pcm_bytes: bytes, sample_rate: int = 16000) -> str:
     """裸 s16le 单声道 PCM → 文本。空音频返回空串。
 
-    识别前先做峰值归一化（2026-11-11）：用户实际说话到设备只剩
-    rms -32~-36dBFS，SenseVoice 在这种电平上识别打折（贾维斯→贾维事）。
-    把峰值拉到 0.5（-6dBFS）再送模型，弱信号的识别准确率显著提升。
-    增益上限 ×20（≈+26dB）：纯底噪顶多变成响一点的底噪，不会凭空出人声。
+    识别前做 RMS 目标电平归一化（2026-11-11 第三版）：用户实际说话到设备
+    只剩 rms -32~-36dBFS，SenseVoice 在这种电平上识别打折（贾维斯→贾维事）。
+    峰值归一化怕噪声尖峰（一个咔哒声就吃掉全部增益空间），改按 RMS 拉到
+    -16dBFS（正常说话电平），增益上限 ×25、峰值钳位 0.95 防削波。
     """
     recognizer = _get_recognizer()
     n = len(pcm_bytes) // 2
     if n == 0:
         return ""
     samples = list(struct.unpack(f"<{n}h", pcm_bytes[: n * 2]))
-    peak = max(abs(s) for s in samples) if samples else 0
-    if 0 < peak < 16000:  # 低于 -6dBFS 才拉，正常电平不动
-        gain = min(16000.0 / peak, 20.0)
-        samples = [
-            max(-32768, min(32767, int(s * gain))) for s in samples
-        ]
+    rms = (sum(s * s for s in samples) / len(samples)) ** 0.5 if samples else 0
+    if rms > 0:
+        rms_db = 20 * math.log10(rms / 32768)
+        if rms_db < -16.0:
+            gain = min(10 ** ((-16.0 - rms_db) / 20), 25.0)
+            ceiling = int(0.95 * 32768)
+            samples = [
+                max(-ceiling, min(ceiling, int(s * gain))) for s in samples
+            ]
     stream = recognizer.create_stream()
     stream.accept_waveform(sample_rate, [s / 32768.0 for s in samples])
     recognizer.decode_stream(stream)
