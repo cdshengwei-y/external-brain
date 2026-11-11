@@ -55,7 +55,11 @@ def model_kind() -> Optional[str]:
 
 
 def is_available() -> bool:
-    """模型文件在不在。sherpa_onnx 缺失也算不可用（调用方回退远程）。"""
+    """模型文件在不在。LOCAL_ASR_DISABLED=1 可强制关闭（测试/排查用）。"""
+    import os
+
+    if os.environ.get("LOCAL_ASR_DISABLED"):
+        return False
     try:
         import sherpa_onnx  # noqa: F401
     except ImportError:

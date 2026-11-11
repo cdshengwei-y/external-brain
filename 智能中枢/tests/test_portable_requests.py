@@ -146,6 +146,12 @@ class FakeRouteProvider:
 
 class PortableRequestServiceTest(unittest.TestCase):
     def setUp(self):
+        # 本机装了 SenseVoice 模型时 local_asr 会抢在假远程识别前面，
+        # 测试断言的是假远程的转写结果——这里强制关掉本地识别。
+        mock.patch(
+            "agent_gateway.local_asr.is_available", return_value=False
+        ).start()
+        self.addCleanup(mock.patch.stopall)
         self.database = tempfile.NamedTemporaryFile(suffix=".db")
         self.store = HubStore(self.database.name)
         self.transport = MemoryTransport()

@@ -2871,6 +2871,20 @@ def describe_audio_level(audio: bytes) -> Optional[str]:
 SILENT_RMS_DBFS = -37.0
 
 
+def _audio_rms_dbfs(audio: bytes) -> Optional[float]:
+    """wav 字节的整段 RMS（dBFS）。解析失败返回 None。"""
+    decoded = _decode_pcm(audio)
+    if decoded is None:
+        return None
+    samples, _sample_rate = decoded
+    if not samples:
+        return None
+    rms = math.sqrt(sum(value * value for value in samples) / len(samples))
+    if rms <= 0:
+        return -99.0
+    return 20 * math.log10(rms / 32768)
+
+
 def audio_silence_note(audio: bytes) -> Optional[str]:
     """整段录音只有底噪（没人说话）时返回原因，用来跳过这次 ASR。
 
@@ -2879,21 +2893,13 @@ def audio_silence_note(audio: bytes) -> Optional[str]:
     「朝鲜族女性。」这种幻听 —— 既花了 0.7 秒和一次调用，又给下游的
     语音门控制造了假信号。能确定没人说话就别送。
     """
-    decoded = _decode_pcm(audio)
-    if decoded is None:
-        return None
-    samples, sample_rate = decoded
-    if not samples:
-        return None
-    rms = math.sqrt(sum(value * value for value in samples) / len(samples))
-    if rms <= 0:
-        return "整段静音"
-    rms_db = 20 * math.log10(rms / 32768)
+    rms_db = _audio_rms_dbfs(audio)
+    if rms_db is None:
+        return None  # 解析不了就别拦，交给远程自己判断
     if rms_db >= SILENT_RMS_DBFS:
         return None
-    duration = len(samples) / float(sample_rate or 1)
     return (
-        f"整段只有底噪：rms={rms_db:.1f}dBFS 时长={duration:.2f}s"
+        f"整段只有底噪：rms={rms_db:.1f}dBFS"
         f"（低于 {SILENT_RMS_DBFS:.0f}dBFS，没有可识别的人声）"
     )
 
