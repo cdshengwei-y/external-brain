@@ -155,6 +155,15 @@ class ParseVoiceCommandTests(unittest.TestCase):
         self.assertIsNone(self.parse("你好"))
 
 
+    def test_colloquial_verb_variants(self):
+        # 2026-11-11 现场：用户说「查微信」/「开微信」，SenseVoice 转写原样
+        self.assertEqual(self.parse("查微信"), ("open_app", "微信"))
+        self.assertEqual(self.parse("开微信"), ("open_app", "微信"))
+        self.assertEqual(self.parse("查一下微信。"), ("open_app", "微信"))
+        # 白名单兜底：这些不会误执行
+        self.assertIsNone(self.parse("查天气"))
+        self.assertIsNone(self.parse("开车"))
+
     def test_garbled_prefixes_from_real_asr(self):
         # 2026-11-11 现场实测：识别结果带乱码前缀和重复，也要能解析
         self.assertEqual(self.parse("打儿子打开微信。"), ("open_app", "微信"))
