@@ -627,7 +627,9 @@ bool capture_until_silence(
     size_t required_silence_chunks = kVadSilenceChunks,
     uint32_t vad_threshold = kVadThreshold,
     uint32_t post_speech_seconds = 0,
-    size_t min_speech_run = 2) {
+    size_t min_speech_run = 2,
+    size_t probe_frames = 0,
+    bool clear_dma = true) {
   if (wav_mono_buffer == nullptr || wav_file == nullptr) {
     Serial.println("[VAD] audio buffers are not ready");
     return false;
@@ -644,8 +646,12 @@ bool capture_until_silence(
     codec_adc_ready = true;
     delay(100);  // 只在首次配置后等 codec 稳定
   }
-  // I2S 常开，上一轮/等待中枢时 DMA 里压着旧数据，不清掉会把上次的尾巴当成本次
-  i2s_zero_dma_buffer(kI2sPort);
+  // I2S 常开，上一轮/等待中枢时 DMA 里压着旧数据，不清掉会把上次的尾巴当成本次。
+  // 例外：流式唤醒探针命中后转入会话的第一轮，DMA 里压着用户说了一半的
+  // 命令尾巴（喊「贾维斯，打开计算器」时探针只含前 1.2s），清掉就丢命令。
+  if (clear_dma) {
+    i2s_zero_dma_buffer(kI2sPort);
+  }
   const size_t window_frames = min(
       static_cast<size_t>(kMaxConversationFrames),
       static_cast<size_t>(max_seconds) * static_cast<size_t>(kSampleRate));
@@ -740,6 +746,13 @@ bool capture_until_silence(
       silence_chunks = 0;
     } else {
       ++silence_chunks;
+    }
+    // 流式唤醒探针（2026-11-11 用户提议）：攒够 1.2s（唤醒词长度）就立刻
+    // 上传，不等尾音静音——喊「贾维斯，打开计算器」时，亮屏和识别发生在
+    // 命令说到一半，说完的尾巴留在 DMA 里由会话态第一轮无缝接走。
+    if (probe_frames > 0 && speech_started &&
+        captured_frames - speech_onset_frames >= probe_frames) {
+      break;
     }
     const bool active = over_threshold;
     if (peak > round_peak) round_peak = peak;
@@ -1979,6 +1992,9 @@ bool converse_with_face() {
 #endif
   Serial.println("[VOICE] listening; say 退下吧 to sleep");
   unsigned long last_activity_ms = millis();
+  // 流式唤醒的衔接（2026-11-11）：探针上传期间用户说了一半的命令还压在
+  // DMA 里，会话态第一轮不清 DMA，把尾巴无缝接进识别；之后各轮照常清。
+  bool first_round = true;
   while (true) {
     if (Serial.available() > 0) {
       Serial.println("[VOICE] conversation interrupted by serial input");
@@ -1997,9 +2013,11 @@ bool converse_with_face() {
     last_session_action = "";
     // 对话态多要一块连续过门限（3 块 = 192ms）：房间里的咳嗽、清嗓子
     // 会被挡在本地，不再白传一次 ASR、也不再让表情屏闪一下思考脸。
-    if (!capture_until_silence(8, kVadSilenceChunks, kVadThreshold, 0, 3)) {
+    if (!capture_until_silence(8, kVadSilenceChunks, kVadThreshold, 0, 3, 0, !first_round)) {
+      first_round = false;
       continue;  // 没说话：idle 计时不重置，攒够 45s 就回去睡
     }
+    first_round = false;
     last_activity_ms = millis();  // 有人说话了，空闲计时从这重新起算
     // 砍掉句首空等 + 峰值归一化，否则 8 秒窗口里可能 4 秒都是底噪，
     // 且人声电平只有 -30 dBFS，ASR 认不出来只能瞎猜。
@@ -2024,6 +2042,8 @@ bool converse_with_face() {
 }
 
 // 待机态：熄屏，只听唤醒词。返回 true = 唤醒了。
+// 流式探针：VAD 触发后攒 1.2s 就上传（不等尾音），唤醒词一出口就亮屏。
+constexpr size_t kWakeProbeFrames = static_cast<size_t>(kSampleRate) * 12 / 10;  // 1.2s
 bool wait_for_wake_word() {
   while (true) {
     if (Serial.available() > 0) {
@@ -2033,7 +2053,8 @@ bool wait_for_wake_word() {
     last_session_action = "";
     // 待机窗口 4 秒（比原来的 3 秒宽），语音一旦确认就改成「从语音起点再给
     // 3 秒」，所以开口晚不会被切断，也不会因为窗口变长而让空转更久。
-    if (!capture_until_silence(4, kWakeVadSilenceChunks, kWakeVadThreshold, 3)) {
+    // probe_frames=1.2s：攒够唤醒词长度立即上传（流式，不等尾音）。
+    if (!capture_until_silence(4, kWakeVadSilenceChunks, kWakeVadThreshold, 3, 2, kWakeProbeFrames)) {
       continue;
     }
     // 连锁指令（2026-11-10 第三版）：凡是捕获到的候选一律整段上传。
