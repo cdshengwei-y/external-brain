@@ -1044,6 +1044,15 @@ class PortableRequestService:
                 text = request.get("text") or ""
             if session_mode == "wake":
                 hit = self._is_wake_phrase(text)
+                if not hit:
+                    # KWS 声学兜底（2026-11-11）：短弱音频整句 ASR 常碎成
+                    # 「该。」「我个没关」，声学关键词检测容错高一个量级。
+                    if self._kws_detects("贾维斯", request):
+                        hit = True
+                        print(
+                            f"[{time.strftime('%H:%M:%S')}] [WAKE] KWS 声学命中",
+                            flush=True,
+                        )
                 # 唤醒失败没有任何其他痕迹（设备只收到 sleep，不发声），
                 # 必须留一行日志，否则用户说「叫不醒」时无从判断是 VAD 没抓到
                 # 还是 ASR 听错、还是关键词表漏了。
@@ -1096,7 +1105,10 @@ class PortableRequestService:
                         session_action="sleep",
                     )
                 return
-            if self._is_exit_phrase(text):
+            if self._is_exit_phrase(text) or (
+                len(str(text or "").strip("。.！!？?，, ")) <= 6
+                and self._kws_detects("退下吧", request)
+            ):
                 # 熄屏是设备侧行为（收到 session_action=sleep 才关背光），
                 # 用户看不到中枢这边做了什么，所以这行日志要留——「说了退下但
                 # 屏幕还亮着」时，先看这里有没有下发，再看设备串口有没有
@@ -2588,6 +2600,25 @@ class PortableRequestService:
             # 有汉字：单字语气词（嗯/哦/啊/哎/呃/唉）算碎片
             return len(normalized) == 1 and normalized in "嗯哦啊哎呃唉"
         return len(normalized) <= 3
+
+    def _kws_detects(self, keyword: str, request: Dict[str, Any]) -> bool:
+        """声学级关键词兜底（sherpa-onnx KWS）。
+
+        短指令（退下吧/贾维斯）整句 ASR 极易碎成「打实当作0决」「该。」，
+        声学关键词检测对含糊发音鲁棒得多。模型缺失/异常一律 False。
+        """
+        try:
+            from agent_gateway import local_kws
+
+            if not local_kws.is_available():
+                return False
+            raw = self._request_media_bytes(request)
+            if not raw:
+                return False
+            return local_kws.detect_keyword(raw) == keyword
+        except Exception as error:  # noqa: BLE001 - 兜底路径不能断链路
+            print(f"[ASR] KWS 失败：{error}", flush=True)
+            return False
 
     def _try_local_host(self, request_id: str, text: str) -> bool:
         """本机控制快通道：「打开WPS / 退出微信 / 打开bilibili.com」。

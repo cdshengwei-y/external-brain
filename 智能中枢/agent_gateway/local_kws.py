@@ -65,8 +65,12 @@ def _get_spotter():
     return _spotter
 
 
-def detect_wake_keyword(wav_bytes: bytes) -> bool:
-    """一段录音里有没有「贾维斯」。解析不了返回 False。"""
+def detect_keyword(wav_bytes: bytes) -> str:
+    """一段录音里检测到的关键词标签（'贾维斯'/'退下吧'），没有返回 ''。
+
+    sherpa_onnx 2.0.1：结果经 spotter.get_result(stream) 取（stream 上没有
+    is_detected 属性，旧 API 在这个版本永远返回 False）。
+    """
     import io
     import struct
     import wave
@@ -76,10 +80,10 @@ def detect_wake_keyword(wav_bytes: bytes) -> bool:
             rate = handle.getframerate()
             frames = handle.readframes(handle.getnframes())
     except (wave.Error, EOFError):
-        return False
+        return ""
     n = len(frames) // 2
     if n == 0:
-        return False
+        return ""
     samples = struct.unpack(f"<{n}h", frames[: n * 2])
     # 峰值归一化到 -6dBFS，与 ASR 路径一致（KWS 也在弱电平上打折）
     peak = max(abs(s) for s in samples) if samples else 0
@@ -95,6 +99,9 @@ def detect_wake_keyword(wav_bytes: bytes) -> bool:
     stream.input_finished()
     while spotter.is_ready(stream):
         spotter.decode_stream(stream)
-    # sherpa_onnx 2.0.1：结果经 spotter.get_result(stream) 取（stream 上没有
-    # is_detected 属性，旧 API 在这个版本永远返回 False）
-    return str(spotter.get_result(stream) or "").strip() != ""
+    return str(spotter.get_result(stream) or "").strip()
+
+
+def detect_wake_keyword(wav_bytes: bytes) -> bool:
+    """兼容入口：录音里有没有「贾维斯」。"""
+    return detect_keyword(wav_bytes) == "贾维斯"
