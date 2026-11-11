@@ -546,6 +546,10 @@ _WAKE_TAILS = (
 )
 # 首字近音集合：贾/加/假/家/嘉/佳/查/扎/杰/雅…都可能是 ASR 对 jia 的写法。
 _WAKE_HEADS = "贾加假家嘉佳查扎杰洁捷雅亚甲价驾"
+# paraformer-small 把「贾维斯」听成「他觉的」（2026-11-11 本地 ASR 实测）：
+# 「觉的/觉斯/觉思」跟在近音首字或「他」后面就是喊名（匹配时带位置和首字
+# 约束，正常话「我觉得可以」不会误触）。
+_WAKE_PARAFORMER_TAILS = ("觉的", "觉斯", "觉思")
 
 
 def _wake_aliases() -> Tuple[str, ...]:
@@ -1999,6 +2003,12 @@ class PortableRequestService:
             return False
         if any(alias in bare for alias in _wake_aliases()):
             return True
+        # paraformer-small 的「他觉的」形态：tail 必须紧跟近音首字/「他」，
+        # 位置约束挡掉「我觉得可以」这类正常话。
+        for tail in _WAKE_PARAFORMER_TAILS:
+            pos = bare.find(tail)
+            if 0 < pos <= 2 and bare[pos - 1] in (_WAKE_HEADS + "他"):
+                return True
         # 「X维斯」的尾音组合在中文里几乎没有别的语义，而首字 ASR 十次错八次：
         # 实测「贾维斯」被转写成「查维斯」，逐字对齐等于永远唤不醒。
         if len(bare) <= 12 and any(tail in bare for tail in _WAKE_TAILS):
@@ -2033,9 +2043,17 @@ class PortableRequestService:
             return ""
 
         remainder: Optional[str] = None
+        # paraformer-small 的「他觉的」形态先剥（与 _is_wake_phrase 同规则）
+        for tail in _WAKE_PARAFORMER_TAILS:
+            pos = bare.find(tail)
+            if 0 < pos <= 2 and bare[pos - 1] in (_WAKE_HEADS + "他"):
+                remainder = bare[pos + len(tail):]
+                break
         # 1) 尾音优先：「维斯」在中文里没有别的语义，唤醒词到尾音结束。
         #    允许唤醒词前面有 0~1 个语气垫字（哎/嗯）。
         for tail in _WAKE_TAILS:
+            if remainder is not None:
+                break
             pos = bare.find(tail)
             if 0 <= pos <= 2:
                 remainder = bare[pos + len(tail):]
