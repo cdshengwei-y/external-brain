@@ -62,7 +62,10 @@ constexpr size_t kMaxWavBytes = 44 + kMaxConversationFrames * sizeof(int16_t);
 constexpr size_t kVadChunkFrames = kCaptureBufferSamples / 2;
 // 尾部静音判定：原来 6/8 chunk（384/512ms）太急，三字唤醒词会被切成两截，
 // 唤醒词一断就唤不醒。统一放到 10 chunk（640ms），等整句说完再收。
-constexpr size_t kVadSilenceChunks = 10;
+// 2026-11-11 二次定值：10→7（448ms）。流式探针上线后唤醒词不再依赖这段
+// 判定（探针 1.2s 就走），7 chunk 只影响对话态收尾速度——448ms 的字间
+// 停顿容忍度足够，说完到开始识别的等待少了 200ms。
+constexpr size_t kVadSilenceChunks = 7;
 // 唤醒词只有三个字（「贾维斯」约 0.9 秒），说完之后 256ms 静音就足够判定
 // 说完了。原来跟表情态一样等 640ms，白白多等 384ms；实测三字之间最长停顿
 // 也就 100ms 左右，256ms 不会被字间停顿骗到。
@@ -124,7 +127,7 @@ constexpr size_t kStreamPrebufferBytes = 96u * 1024u;
 constexpr size_t kStreamPrebufferMinBytes = 24u * 1024u;
 // 上一轮回复播完到下一次开始录音之间的静默窗口。喇叭尾音还在屋里回荡，
 // 立刻开录会把「自己的声音」当成下一句，形成自问自答的死循环。
-constexpr uint32_t kPostReplyGuardMs = 700;
+constexpr uint32_t kPostReplyGuardMs = 450;
 
 bool i2c_started = false;
 bool i2s_started = false;

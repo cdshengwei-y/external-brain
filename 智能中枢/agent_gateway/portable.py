@@ -1047,7 +1047,10 @@ class PortableRequestService:
                 # 唤醒失败没有任何其他痕迹（设备只收到 sleep，不发声），
                 # 必须留一行日志，否则用户说「叫不醒」时无从判断是 VAD 没抓到
                 # 还是 ASR 听错、还是关键词表漏了。
-                print(f"[WAKE] 转写={text!r} -> {'唤醒' if hit else '未命中'}", flush=True)
+                print(
+                    f"[{time.strftime('%H:%M:%S')}] [WAKE] 转写={text!r} -> {'唤醒' if hit else '未命中'}",
+                    flush=True,
+                )
                 if hit:
                     # 2026-11-06 实测：唤醒「维斯。」成功，紧接着说的「给我讲个笑话」
                     # 被门控当环境语音丢掉，用户看到的症状就是「只听懂唤醒和结束」。
@@ -1072,6 +1075,10 @@ class PortableRequestService:
                             text=remainder,
                             input_type="text",
                             session_mode="conversation",
+                        )
+                        print(
+                            f"[{time.strftime('%H:%M:%S')}] [WAKE] 连锁指令：{remainder!r}",
+                            flush=True,
                         )
                         self._process_request(request_id, depth + 1)
                         return
@@ -1813,7 +1820,7 @@ class PortableRequestService:
                 local_started = time.perf_counter()
                 local_text = local_asr.transcribe_wav(payload_bytes)
                 print(
-                    f"[TIMING] asr-local={(time.perf_counter() - local_started) * 1000:.0f}ms "
+                    f"[{time.strftime('%H:%M:%S')}] [TIMING] asr-local={(time.perf_counter() - local_started) * 1000:.0f}ms "
                     f"text={local_text!r} {tag}".rstrip(),
                     flush=True,
                 )
@@ -2604,7 +2611,7 @@ class PortableRequestService:
             response_audio_content_type=audio[2] if audio else None,
             result={"intent": {"intent": action, "source": "local-fast"}},
         )
-        print(f"[HOST] 快通道：{action} {target}", flush=True)
+        print(f"[{time.strftime('%H:%M:%S')}] [HOST] 快通道：{action} {target}", flush=True)
         return True
 
     def _finish_fountain(self, request_id: str, fountain_action: str) -> None:
