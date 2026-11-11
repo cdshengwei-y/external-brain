@@ -2578,13 +2578,15 @@ class PortableRequestService:
         这种转写送进意图路由 = 白等 8~12 秒预算再「没听清」。识别结果
         连一个汉字都没有、长度 ≤3 —— 直接本地快速回「没听清」，不碰模型。
         真正的短中文应答（嗯/好/行）不受影响，照常走原链路。
+        语言锁 zh 后噪声变成「嗯/哦/啊」这类单字语气词 —— 同样当碎片静默跳过。
         """
         normalized = "".join(str(text or "").lower().split())
         normalized = normalized.strip("。.！!？?，,、~～…—-·\"'“”‘’")
         if not normalized:
             return True
         if any("\u4e00" <= ch <= "\u9fff" for ch in normalized):
-            return False
+            # 有汉字：单字语气词（嗯/哦/啊/哎/呃/唉）算碎片
+            return len(normalized) == 1 and normalized in "嗯哦啊哎呃唉"
         return len(normalized) <= 3
 
     def _try_local_host(self, request_id: str, text: str) -> bool:

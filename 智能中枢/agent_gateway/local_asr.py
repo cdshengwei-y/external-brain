@@ -84,6 +84,7 @@ def _get_recognizer():
             tokens=str(directory / "tokens.txt"),
             num_threads=2,
             use_itn=True,  # 数字直接出阿拉伯数字，「现在几点」回复更好念
+            language="zh",  # 锁中文：auto 会把弱信号猜成 'Yeah.'/'I.' 英文碎片
         )
         _loaded_kind = "sense-voice"
     else:
