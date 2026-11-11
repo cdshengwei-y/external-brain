@@ -808,9 +808,9 @@ class PortableRequestService:
             self._voice_window_seconds = 45.0
         self._voice_last_active: Dict[str, float] = {}
         # 实时转写（2026-11-11）：session_mode=live 的分段转写模式。
-        # _live_buffers: device_id -> (最近活跃 ts, 累积文本行)；10 分钟无动静重置。
+        # _live_buffers: device_id -> (最近活跃 ts, [(段序号, 文本)…], 下一个段序号)。
         # _live_frames: request_id -> 渲染好的 240x240 RGB565 帧，供设备 GET /frame 拉取。
-        self._live_buffers: Dict[str, Tuple[float, List[str]]] = {}
+        self._live_buffers: Dict[str, Tuple[float, List[Tuple[int, str]], int]] = {}
         self._live_frames: Dict[str, bytes] = {}
         # TTS 结果缓存：桌宠的固定话术（「好的，我先待命。」「音乐喷泉已关闭。」）
         # 每次都要 0.7 秒重新合成，缓存后重复句子直接命中，省掉这一整段。
@@ -1004,25 +1004,28 @@ class PortableRequestService:
     def _handle_live_request(
         self, request_id: str, request: Dict[str, Any], text: str
     ) -> None:
-        """分段转写：把本段文本追加到会话缓冲，渲染屏幕帧回给设备。
+        """分段转写：把本段文本折行成显示段追加到会话缓冲，渲染屏幕帧回给设备。
 
         不进意图路由、不执行动作、不合成语音——屏幕就是唯一出口。
-        设备端说「退下」类词（session_action=sleep）或空闲 45s 自己回去睡。
+        缓冲按「绝对序号」记段：第 i 段永远写在屏幕第 i % 16 行，写满整屏
+        回卷覆盖最旧的行（2026-11-11 用户定稿「说满了从头开始」）。
+        说「退下/清屏」类词清空缓冲重新开始（字幕屏常亮，不熄屏）。
         """
         device_id = str(request.get("portable_device_id") or "")
         cleaned = str(text or "").strip().strip("。.，,！!？? ")
         now_ts = time.time()
         exit_requested = any(
-            word in cleaned for word in ("退下", "别说了", "停下吧", "睡觉吧", "拜拜", "再见")
+            word in cleaned for word in ("退下", "清屏", "清空", "别说了", "停下吧")
         )
 
         buf = self._live_buffers.get(device_id)
         if buf is not None and now_ts - buf[0] > 600:
             buf = None  # 10 分钟没动静：上一段话早凉了，重新开页
         if buf is None:
-            lines: List[str] = []
+            segments: List[Tuple[int, str]] = []
+            next_index = 0
         else:
-            lines = buf[1]
+            segments, next_index = buf[1], buf[2]
 
         if (
             cleaned
@@ -1030,31 +1033,37 @@ class PortableRequestService:
             and not self._is_noise_transcript(cleaned)
             and not self._is_latin_fragment(cleaned)
         ):
-            lines.append(f"[{time.strftime('%H:%M:%S')}] {cleaned}")
-            del lines[:-12]  # 缓冲只留最近 12 行，渲染时再取最后 6 行
-            self._live_buffers[device_id] = (now_ts, lines)
+            from agent_gateway.live_screen import wrap_text
+
+            for piece in wrap_text(cleaned):
+                segments.append((next_index, piece))
+                next_index += 1
+            del segments[:-96]  # 缓冲只留 6 屏的段
+            self._live_buffers[device_id] = (now_ts, segments, next_index)
         elif exit_requested:
             self._live_buffers.pop(device_id, None)
-            lines = []
+            segments = []
+            next_index = 0
 
         from agent_gateway.live_screen import render_live_frame
 
         if exit_requested:
-            frame = render_live_frame([], note="晚安～")
-        elif lines:
-            frame = render_live_frame(lines)
+            frame = render_live_frame([], note="已清屏，继续说…")
+        elif segments:
+            frame = render_live_frame(segments)
         else:
             frame = render_live_frame([], note="说话吧…")
         self._live_frames[request_id] = frame
         print(
             f"[{time.strftime('%H:%M:%S')}] [LIVE] {cleaned!r}"
-            f" exit={exit_requested} 累计={len(lines)}行",
+            f" exit={exit_requested} 已显示={next_index}段",
             flush=True,
         )
         self._update(
             request_id,
             state="completed",
             response_text=cleaned or None,
+            # sleep 对设备语义 = 清屏继续（字幕屏常亮，不熄屏）
             session_action="sleep" if exit_requested else "continue",
         )
 

@@ -2103,53 +2103,45 @@ bool submit_live_chunk(String& transcript, bool& sleep_now) {
   return false;
 }
 
-// 实时转写态：字幕屏。返回 true = 该熄屏待命（说「退下」或空闲超时）；
-// false = 被串口打断。
+// 实时转写态：字幕屏（2026-11-11 二版）。
+// 免唤醒、屏幕常亮、上电即开始——说「退下/清屏」清空字幕重新开始。
+// 永不熄屏、永不回待机，只有串口打断才返回。返回值仅反映退出原因。
 bool run_live_transcription() {
-  constexpr unsigned long kIdleSleepMs = 45000;
-  face::suspend();  // 表情撤掉（2026-11-11）：屏幕交给转写文字
+  face::suspend();  // 表情撤掉：屏幕全程交给转写文字
   if (!face::ready()) {
     face::begin();
   }
   screen_bus::set_backlight(true);
-  screen_bus::tft().fillScreen(0x0841);  // 与中枢帧背景同色（10,16,34）
-  Serial.println("[LIVE] live transcription mode; say 退下/再见 to sleep");
-  unsigned long last_activity_ms = millis();
-  // 流式唤醒的衔接：探针上传期间说的半句话还在 DMA 里，第一轮不清缓冲。
-  bool first_round = true;
+  screen_bus::tft().fillScreen(0x0841);  // 与中枢帧背景同色（8,14,32）
+  Serial.println("[LIVE] live subtitle mode; say 退下/清屏 to clear");
   while (true) {
     if (Serial.available() > 0) {
       Serial.println("[LIVE] interrupted by serial input");
       return false;
     }
-    if (millis() - last_activity_ms >= kIdleSleepMs) {
-      Serial.println("[LIVE] idle 45s; back to standby");
-      return true;
-    }
-    delay(kPostReplyGuardMs);
-    if (i2s_started && !first_round) {
+    // 本机不播音（字幕模式没有 TTS），不存在自问自答，每轮直接清 DMA 收新的
+    if (i2s_started) {
       i2s_zero_dma_buffer(kI2sPort);
     }
     last_session_action = "";
     // 每段最多 3 秒、尾音 4 块（256ms）就收——字幕要的是快，长句被拆成
-    // 多段没关系，中枢按顺序拼行显示。
-    if (!capture_until_silence(3, 4, kWakeVadThreshold, 0, 2, 0, !first_round)) {
-      first_round = false;
-      continue;
+    // 多段没关系，中枢按顺序折行显示，写满 16 行回卷覆盖最旧的。
+    // 门限用待机档 500：字幕屏的场景就是「凑着麦说话」，宁可多传不漏字。
+    if (!capture_until_silence(3, 4, kWakeVadThreshold, 0, 2)) {
+      continue;  // 没人说话：继续听，屏幕保持常亮
     }
-    first_round = false;
-    last_activity_ms = millis();
     normalize_capture_peak();
     String transcript;
-    bool sleep_now = false;
-    if (!submit_live_chunk(transcript, sleep_now)) {
+    bool clear_screen = false;
+    if (!submit_live_chunk(transcript, clear_screen)) {
       Serial.println("[LIVE] hub unreachable; retry in 2s");
       delay(2000);
       continue;
     }
-    if (sleep_now) {
-      Serial.println("[LIVE] exit phrase recognised");
-      return true;
+    if (clear_screen) {
+      // 中枢已清空缓冲，本地同步清屏（不熄屏，继续转写）
+      Serial.println("[LIVE] clear requested; subtitles reset");
+      screen_bus::tft().fillScreen(0x0841);
     }
   }
 }
@@ -2265,33 +2257,11 @@ bool wait_for_wake_word() {
 }
 
 void run_voice_conversation() {
-  // 上电即静默待机（2026-11-10 改）：上电全程黑屏，不画首页也不画「闭眼」，
-  // 喊「贾维斯」才第一次亮屏。此前（2026-11-06 版）上电会先亮表情首页、
-  // 再让闭眼露 350ms 才熄屏，用户实测觉得「上电不该亮屏幕」。
-  Serial.println("[VOICE] pet mode: silent standby at boot, say 贾维斯 to wake");
-#ifdef PET_FOUNTAIN
-  enter_standby_state(false);
-#endif
-  bool awake = false;
-  while (true) {
-    if (awake) {
-      // 实时转写态（2026-11-11）：表情撤掉，屏幕显示实时字幕。
-      // 原对话态 converse_with_face() 保留未删，需要回表情对话时换回即可。
-      if (!run_live_transcription()) {
-        Serial.println("[VOICE] manual mode; send v to resume pet mode");
-        return;
-      }
-#ifdef PET_FOUNTAIN
-      enter_standby_state();
-#endif
-      awake = false;
-    } else {
-      if (!wait_for_wake_word()) {
-        Serial.println("[VOICE] manual mode; send v to resume pet mode");
-        return;
-      }
-      awake = true;
-    }
+  // 实时字幕模式（2026-11-11 二版）：免唤醒词、屏幕常亮，上电即开始转写。
+  // 原来的「静默待机 ⇄ 唤醒 ⇄ 对话」状态机整体停用，字幕屏永不离开。
+  Serial.println("[VOICE] live subtitle mode: always on, no wake word");
+  if (!run_live_transcription()) {
+    Serial.println("[VOICE] manual mode; send v to resume live mode");
   }
 }
 
@@ -2300,7 +2270,7 @@ void print_help() {
   Serial.println("[CMD] w = capture 1 second mono WAV over USB (功放保持关闭)");
   Serial.println("[CMD] u = capture WAV and upload it to the hub over Wi-Fi");
   Serial.println("[CMD] k = upload a short clip for server-side wake-word detection");
-  Serial.println("[CMD] v = 启动桌宠状态机（实时转写字幕 ⇄ 待机）");
+  Serial.println("[CMD] v = 启动实时字幕模式（免唤醒，常亮转写）");
   Serial.println("[CMD] p = play fixed wake response 我在！");
   Serial.println("[CMD] t = play a 3-second 1kHz hardware test tone");
   Serial.println("[CMD] s = scan I2C bus");
