@@ -12,7 +12,7 @@ import uuid
 import wave
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional, Protocol, Tuple
+from typing import Any, Dict, List, Optional, Protocol, Tuple
 
 from hub_core.errors import ConflictError, HubError, ValidationError
 from hub_core.service import HubService
@@ -807,6 +807,11 @@ class PortableRequestService:
         except ValueError:
             self._voice_window_seconds = 45.0
         self._voice_last_active: Dict[str, float] = {}
+        # 实时转写（2026-11-11）：session_mode=live 的分段转写模式。
+        # _live_buffers: device_id -> (最近活跃 ts, 累积文本行)；10 分钟无动静重置。
+        # _live_frames: request_id -> 渲染好的 240x240 RGB565 帧，供设备 GET /frame 拉取。
+        self._live_buffers: Dict[str, Tuple[float, List[str]]] = {}
+        self._live_frames: Dict[str, bytes] = {}
         # TTS 结果缓存：桌宠的固定话术（「好的，我先待命。」「音乐喷泉已关闭。」）
         # 每次都要 0.7 秒重新合成，缓存后重复句子直接命中，省掉这一整段。
         self._tts_cache: Dict[str, Tuple[bytes, str, str]] = {}
@@ -994,6 +999,72 @@ class PortableRequestService:
         device_id = str(request.get("portable_device_id") or "")
         return self.devices.apply_volume(device_id, audio), str(content_type)
 
+    # ---------------- 实时转写（session_mode=live） ----------------
+
+    def _handle_live_request(
+        self, request_id: str, request: Dict[str, Any], text: str
+    ) -> None:
+        """分段转写：把本段文本追加到会话缓冲，渲染屏幕帧回给设备。
+
+        不进意图路由、不执行动作、不合成语音——屏幕就是唯一出口。
+        设备端说「退下」类词（session_action=sleep）或空闲 45s 自己回去睡。
+        """
+        device_id = str(request.get("portable_device_id") or "")
+        cleaned = str(text or "").strip().strip("。.，,！!？? ")
+        now_ts = time.time()
+        exit_requested = any(
+            word in cleaned for word in ("退下", "别说了", "停下吧", "睡觉吧", "拜拜", "再见")
+        )
+
+        buf = self._live_buffers.get(device_id)
+        if buf is not None and now_ts - buf[0] > 600:
+            buf = None  # 10 分钟没动静：上一段话早凉了，重新开页
+        if buf is None:
+            lines: List[str] = []
+        else:
+            lines = buf[1]
+
+        if (
+            cleaned
+            and not exit_requested
+            and not self._is_noise_transcript(cleaned)
+            and not self._is_latin_fragment(cleaned)
+        ):
+            lines.append(f"[{time.strftime('%H:%M:%S')}] {cleaned}")
+            del lines[:-12]  # 缓冲只留最近 12 行，渲染时再取最后 6 行
+            self._live_buffers[device_id] = (now_ts, lines)
+        elif exit_requested:
+            self._live_buffers.pop(device_id, None)
+            lines = []
+
+        from agent_gateway.live_screen import render_live_frame
+
+        if exit_requested:
+            frame = render_live_frame([], note="晚安～")
+        elif lines:
+            frame = render_live_frame(lines)
+        else:
+            frame = render_live_frame([], note="说话吧…")
+        self._live_frames[request_id] = frame
+        print(
+            f"[{time.strftime('%H:%M:%S')}] [LIVE] {cleaned!r}"
+            f" exit={exit_requested} 累计={len(lines)}行",
+            flush=True,
+        )
+        self._update(
+            request_id,
+            state="completed",
+            response_text=cleaned or None,
+            session_action="sleep" if exit_requested else "continue",
+        )
+
+    def get_frame(self, request_id: str) -> bytes:
+        """设备拉取本次转写请求对应的屏幕帧（240x240 RGB565 大端）。"""
+        frame = self._live_frames.get(request_id)
+        if not isinstance(frame, bytes) or not frame:
+            raise HubError("该请求没有屏幕帧（只有 live 模式有）", status_code=404)
+        return frame
+
     def confirm(self, request_id: str, plan_id: str) -> Dict[str, Any]:
         request = self.hub.store.get_portable_request(request_id)
         if request is None:
@@ -1042,6 +1113,10 @@ class PortableRequestService:
                     text = self._transcribe_request(request_id, request)
             else:
                 text = request.get("text") or ""
+            # 实时转写模式：只转写字幕，不进意图/执行管线（2026-11-11）。
+            if session_mode == "live":
+                self._handle_live_request(request_id, request, text)
+                return
             if session_mode == "wake":
                 hit = self._is_wake_phrase(text)
                 if not hit:
@@ -1927,9 +2002,9 @@ class PortableRequestService:
         values["protocol_version"] = "1.0"
         values["source"] = source.strip()
         session_mode = payload.get("session_mode", "conversation")
-        if session_mode not in {"wake", "conversation", "music_control"}:
+        if session_mode not in {"wake", "conversation", "music_control", "live"}:
             raise ValidationError(
-                "session_mode 必须是 wake、conversation 或 music_control"
+                "session_mode 必须是 wake、conversation、music_control 或 live"
             )
         values["session_mode"] = session_mode
         text = payload.get("text")

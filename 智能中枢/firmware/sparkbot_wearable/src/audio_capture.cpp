@@ -18,6 +18,7 @@
 #ifdef PET_FOUNTAIN
 #include "fountain_display.h"
 #include "face_display.h"
+#include "screen_bus.h"
 #include "music_player.h"
 #endif
 
@@ -1803,13 +1804,14 @@ void wait_for_audio_request(
       const bool finished = state == "completed" || state == "succeeded";
       if (finished && session_action == "awake") {
 #ifdef PET_FOUNTAIN
-        // 音画同步（2026-11-10）：黑屏期间先把 TX 通路备好，然后亮屏
-        // （= 功放供电）与「我在」出声同一瞬间发生，表情直接上说话嘴型。
-        // 顺序不能反：功放和背光共用 GPIO46，黑屏里出声是哑的。
+        // 实时转写模式（2026-11-11）：表情撤掉。唤醒瞬间只备好 TX 通路
+        // 并点亮背光（背光 GPIO46 与功放供电共用，不亮屏出声是哑的），
+        // 播完「我在」屏幕立刻由字幕帧接管，全程不画表情。
         const bool playback_ready = prepare_wakeup_playback();
-        enter_face_state();
-        face::set_expression(face::kSpeaking);
-        face::tick();
+        if (!face::ready()) {
+          face::begin();
+        }
+        screen_bus::set_backlight(true);
         if (playback_ready) {
           play_wakeup_audio_prepared();
         }
@@ -1995,6 +1997,163 @@ void upload_wav_to_hub(const char* session_mode = "conversation") {
   submit_captured_wav_to_hub(session_mode);
 }
 
+// ---------------- 实时转写模式（2026-11-11） ----------------
+// 表情撤掉，屏幕变成字幕屏：设备把每段话传给中枢本地识别（SenseVoice），
+// 中枢把累积文本渲染成 240x240 RGB565 整帧回传，设备直接贴屏。
+// 不进意图管线、不回语音——屏幕就是唯一出口。
+
+constexpr size_t kLiveFrameBytes = 240UL * 240UL * 2UL;
+uint8_t* live_frame_buffer = nullptr;  // PSRAM，115KB
+
+bool fetch_and_draw_live_frame(const String& request_id) {
+  const String url = String(SPARKBOT_HUB_BASE_URL) +
+                     "/api/v1/portable/v1/requests/" + request_id + "/frame";
+  WiFiClient client;
+  HTTPClient http;
+  if (!http.begin(client, url)) {
+    return false;
+  }
+  http.setTimeout(10000);
+  const int code = http.GET();
+  if (code != 200) {
+    http.end();
+    return false;
+  }
+  const int len = http.getSize();
+  if (len != static_cast<int>(kLiveFrameBytes)) {
+    http.end();
+    return false;
+  }
+  if (live_frame_buffer == nullptr) {
+    live_frame_buffer = static_cast<uint8_t*>(ps_malloc(kLiveFrameBytes));
+    if (live_frame_buffer == nullptr) {
+      Serial.println("[LIVE] frame buffer alloc failed");
+      http.end();
+      return false;
+    }
+  }
+  WiFiClient* stream = http.getStreamPtr();
+  size_t received = 0;
+  while (received < kLiveFrameBytes) {
+    const int got =
+        stream->read(live_frame_buffer + received, kLiveFrameBytes - received);
+    if (got < 0) {
+      break;
+    }
+    received += static_cast<size_t>(got);
+  }
+  http.end();
+  if (received != kLiveFrameBytes) {
+    Serial.printf("[LIVE] frame short read: %u/%u\n",
+                  static_cast<unsigned>(received),
+                  static_cast<unsigned>(kLiveFrameBytes));
+    return false;
+  }
+  // 大端 RGB565：uint8 强转 uint16 后 pushImage 的字节交换正好补回 LCD 要的序
+  screen_bus::tft().pushImage(
+      0, 0, 240, 240, reinterpret_cast<uint16_t*>(live_frame_buffer));
+  return true;
+}
+
+bool submit_live_chunk(String& transcript, bool& sleep_now) {
+  transcript = "";
+  sleep_now = false;
+  build_wav_file();
+  if (!connect_wifi_for_upload()) {
+    return false;
+  }
+  String media_id;
+  if (!post_audio_to_hub(media_id)) {
+    return false;
+  }
+  String request_id;
+  if (!submit_audio_request(media_id, "live", request_id)) {
+    return false;
+  }
+  const String url = String(SPARKBOT_HUB_BASE_URL) +
+                     "/api/v1/portable/v1/requests/" + request_id;
+  const unsigned long deadline = millis() + 15000;
+  while (millis() < deadline) {
+    WiFiClient client;
+    HTTPClient http;
+    if (!http.begin(client, url)) {
+      return false;
+    }
+    http.setTimeout(10000);
+    const int code = http.GET();
+    const String response = http.getString();
+    http.end();
+    if (code != 200) {
+      return false;
+    }
+    DynamicJsonDocument document(4096);
+    if (deserializeJson(document, response) != DeserializationError::Ok) {
+      return false;
+    }
+    const String state = document["state"].as<String>();
+    if (state == "completed" || state == "succeeded" || state == "failed") {
+      transcript = document["transcript"].as<String>();
+      sleep_now = document["session_action"].as<String>() == "sleep";
+      fetch_and_draw_live_frame(request_id);
+      return true;
+    }
+    delay(150);
+  }
+  Serial.println("[LIVE] request polling timed out");
+  return false;
+}
+
+// 实时转写态：字幕屏。返回 true = 该熄屏待命（说「退下」或空闲超时）；
+// false = 被串口打断。
+bool run_live_transcription() {
+  constexpr unsigned long kIdleSleepMs = 45000;
+  face::suspend();  // 表情撤掉（2026-11-11）：屏幕交给转写文字
+  if (!face::ready()) {
+    face::begin();
+  }
+  screen_bus::set_backlight(true);
+  screen_bus::tft().fillScreen(0x0841);  // 与中枢帧背景同色（10,16,34）
+  Serial.println("[LIVE] live transcription mode; say 退下/再见 to sleep");
+  unsigned long last_activity_ms = millis();
+  // 流式唤醒的衔接：探针上传期间说的半句话还在 DMA 里，第一轮不清缓冲。
+  bool first_round = true;
+  while (true) {
+    if (Serial.available() > 0) {
+      Serial.println("[LIVE] interrupted by serial input");
+      return false;
+    }
+    if (millis() - last_activity_ms >= kIdleSleepMs) {
+      Serial.println("[LIVE] idle 45s; back to standby");
+      return true;
+    }
+    delay(kPostReplyGuardMs);
+    if (i2s_started && !first_round) {
+      i2s_zero_dma_buffer(kI2sPort);
+    }
+    last_session_action = "";
+    // 每段最多 3 秒、尾音 4 块（256ms）就收——字幕要的是快，长句被拆成
+    // 多段没关系，中枢按顺序拼行显示。
+    if (!capture_until_silence(3, 4, kWakeVadThreshold, 0, 2, 0, !first_round)) {
+      first_round = false;
+      continue;
+    }
+    first_round = false;
+    last_activity_ms = millis();
+    normalize_capture_peak();
+    String transcript;
+    bool sleep_now = false;
+    if (!submit_live_chunk(transcript, sleep_now)) {
+      Serial.println("[LIVE] hub unreachable; retry in 2s");
+      delay(2000);
+      continue;
+    }
+    if (sleep_now) {
+      Serial.println("[LIVE] exit phrase recognised");
+      return true;
+    }
+  }
+}
+
 // 表情态：亮屏、持续聆听。说的话直接送中枢（聊天 / 搜索 / 动手都行），
 // 不需要唤醒词——屏幕上那张脸本身就是「我在」。
 // 返回 true = 该熄屏待命了（「退下吧」或空闲超时）；false = 被串口打断。
@@ -2116,7 +2275,9 @@ void run_voice_conversation() {
   bool awake = false;
   while (true) {
     if (awake) {
-      if (!converse_with_face()) {
+      // 实时转写态（2026-11-11）：表情撤掉，屏幕显示实时字幕。
+      // 原对话态 converse_with_face() 保留未删，需要回表情对话时换回即可。
+      if (!run_live_transcription()) {
         Serial.println("[VOICE] manual mode; send v to resume pet mode");
         return;
       }
@@ -2139,7 +2300,7 @@ void print_help() {
   Serial.println("[CMD] w = capture 1 second mono WAV over USB (功放保持关闭)");
   Serial.println("[CMD] u = capture WAV and upload it to the hub over Wi-Fi");
   Serial.println("[CMD] k = upload a short clip for server-side wake-word detection");
-  Serial.println("[CMD] v = 启动桌宠状态机（表情态 ⇄ 待机态）");
+  Serial.println("[CMD] v = 启动桌宠状态机（实时转写字幕 ⇄ 待机）");
   Serial.println("[CMD] p = play fixed wake response 我在！");
   Serial.println("[CMD] t = play a 3-second 1kHz hardware test tone");
   Serial.println("[CMD] s = scan I2C bus");

@@ -238,6 +238,10 @@ class HubRequestHandler(BaseHTTPRequestHandler):
                 audio, content_type = self.portable_service.get_audio(request_id)
                 self._send_binary(200, audio, content_type)
                 return
+            if parsed.path.startswith("/api/v1/portable/v1/requests/") and parsed.path.endswith("/frame"):
+                request_id = parsed.path.rstrip("/").split("/")[-2]
+                self._send_binary(200, self.portable_service.get_frame(request_id), "application/octet-stream")
+                return
             if parsed.path.startswith("/api/v1/portable/v1/requests/"):
                 request_id = parsed.path.rstrip("/").split("/")[-1]
                 self._send_json(200, self.portable_service.get(request_id))
