@@ -2861,7 +2861,10 @@ def describe_audio_level(audio: bytes) -> Optional[str]:
 # peak 已经不能判断有没有人说话，只有整段 RMS 还能区分。
 # 实测（2026-11-06，pre_div 修好后）：正常说话 RMS 在 -14 ~ -25 dBFS；
 # 只有底噪的那几条（ASR 识别成「嗯。」「咳。」）在 -34 dBFS 左右。
-SILENT_RMS_DBFS = -31.0
+# 2026-11-11 二次定值：-31 → -37。现场实测用户实际说话 RMS 落在
+# -32.5 ~ -36.5 dBFS，-31 的线把真话当底噪扔了（用户喊很多次才碰中一次
+# 过线的）。-37 只挡纯底噪（真底噪在 -45 以下）。
+SILENT_RMS_DBFS = -37.0
 
 
 def audio_silence_note(audio: bytes) -> Optional[str]:
