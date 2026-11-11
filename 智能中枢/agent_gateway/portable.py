@@ -1199,22 +1199,19 @@ class PortableRequestService:
                     conversation_id=str(request.get("conversation_id") or ""),
                 ):
                     return
-                # 无效语音碎片（SenseVoice 偶发吐 'I.' 这类纯英文碎片）：
-                # 立即回「没听清」，绝不送模型白等 8~12 秒预算（2026-11-11）。
+                # 无效语音碎片（SenseVoice 对环境噪声会吐 'I.'/'Okay.' 这类
+                # 纯英文碎片）：静默跳过，绝不回「没听清」——2026-11-11 现场
+                # 用户没说话，环境噪声碎片被当指令回话，对着空房间讲话很怪。
+                # 也不送模型白等 8~12 秒预算。真话被听错时用户自然会重说。
                 if self._is_latin_fragment(text):
-                    reply = "你刚说什么？我没听清，再说一遍。"
-                    audio = self._synthesize(reply)
                     self._update(
                         request_id,
                         state="completed",
-                        response_text=reply,
+                        response_text="",
                         session_action="continue",
-                        response_audio=audio[0] if audio else None,
-                        response_audio_format=audio[1] if audio else None,
-                        response_audio_content_type=audio[2] if audio else None,
                         result={"intent": {"intent": "fragment", "source": "local-fast"}},
                     )
-                    print(f"[ASR] 无效碎片，快速回没听清：{text!r}", flush=True)
+                    print(f"[ASR] 无效碎片，静默跳过：{text!r}", flush=True)
                     return
                 # 「说慢点」改的是中枢 TTS 的语速，比设备音量更接近用户本意，
                 # 必须排在 device 之前：模型会把「讲慢一点」误判成调音量。
