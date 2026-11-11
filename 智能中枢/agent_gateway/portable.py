@@ -1199,6 +1199,23 @@ class PortableRequestService:
                     conversation_id=str(request.get("conversation_id") or ""),
                 ):
                     return
+                # 无效语音碎片（SenseVoice 偶发吐 'I.' 这类纯英文碎片）：
+                # 立即回「没听清」，绝不送模型白等 8~12 秒预算（2026-11-11）。
+                if self._is_latin_fragment(text):
+                    reply = "你刚说什么？我没听清，再说一遍。"
+                    audio = self._synthesize(reply)
+                    self._update(
+                        request_id,
+                        state="completed",
+                        response_text=reply,
+                        session_action="continue",
+                        response_audio=audio[0] if audio else None,
+                        response_audio_format=audio[1] if audio else None,
+                        response_audio_content_type=audio[2] if audio else None,
+                        result={"intent": {"intent": "fragment", "source": "local-fast"}},
+                    )
+                    print(f"[ASR] 无效碎片，快速回没听清：{text!r}", flush=True)
+                    return
                 # 「说慢点」改的是中枢 TTS 的语速，比设备音量更接近用户本意，
                 # 必须排在 device 之前：模型会把「讲慢一点」误判成调音量。
                 if self._try_local_speech_rate(request_id, text):
@@ -2549,6 +2566,22 @@ class PortableRequestService:
             result={"intent": result.public()},
         )
         return True
+
+    @staticmethod
+    def _is_latin_fragment(text: str) -> bool:
+        """SenseVoice 对短噪声/无效语音会输出纯英文碎片（实测 'I.'）。
+
+        这种转写送进意图路由 = 白等 8~12 秒预算再「没听清」。识别结果
+        连一个汉字都没有、长度 ≤3 —— 直接本地快速回「没听清」，不碰模型。
+        真正的短中文应答（嗯/好/行）不受影响，照常走原链路。
+        """
+        normalized = "".join(str(text or "").lower().split())
+        normalized = normalized.strip("。.！!？?，,、~～…—-·\"'“”‘’")
+        if not normalized:
+            return True
+        if any("\u4e00" <= ch <= "\u9fff" for ch in normalized):
+            return False
+        return len(normalized) <= 3
 
     def _try_local_host(self, request_id: str, text: str) -> bool:
         """本机控制快通道：「打开WPS / 退出微信 / 打开bilibili.com」。
