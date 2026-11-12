@@ -438,10 +438,10 @@ bool start_i2s(i2s_mode_t direction) {
       // 4×256 只有 32ms 的缓冲，播放时每写一块还要画一次屏（240×190×2 走 40MHz SPI
       // 约 18ms），DMA 必然被抽干，声音就变成卡顿、重复的「鬼畜」音。
       // 扩到 16×256 ≈ 128ms 给 CPU 留出余量。
-      // 2026-11-11 三扩到 64×256 ≈ 1s：实时字幕模式里上传+识别的空档期
-      // 用户还在连续说话，这段音频全压在 DMA 环形缓冲里，ring 比空档短就
-      // 溢出丢词（用户实测「丢词有点严重」）。64 档 = 内部 RAM 再 +16KB。
-      .dma_buf_count = 64,
+      // 2026-11-12 四扩到 96×256 ≈ 1.5s：串口实测设备每轮 HTTP 中位 431ms、
+      // 最大 3.5s（WiFi 抖动 + 每轮 TCP 握手），1s ring 挡不住最差轮次。
+      // 96 档 = 内部 RAM 再 +32KB，换 0.5s 的丢词余量。
+      .dma_buf_count = 96,
       .dma_buf_len = 256,
       .use_apll = true,
       // 欠载（DMA 被抽干）时一定要输出静音，不能让它循环重播最后一段缓冲。
@@ -2195,8 +2195,8 @@ bool run_live_transcription() {
     // ② 推给中枢流式解码（响应很快，不做整段识别）
     const unsigned long http_started = millis();
     if (!live_stream_post(wav_mono_buffer, kStreamChunkFrames)) {
-      Serial.println("[LIVE] hub unreachable; retry in 1s");
-      delay(1000);
+      Serial.println("[LIVE] hub unreachable; retry in 300ms");
+      delay(300);
       continue;
     }
     // ③ 每轮都拉字幕帧（差量下发只有几 KB）——上屏节奏 ~0.7s

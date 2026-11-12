@@ -213,6 +213,11 @@ def _pcm_wav_header(data_bytes: int, rate: int = 16000) -> bytes:
 
 class HubRequestHandler(BaseHTTPRequestHandler):
     server_version = "SmartHub/0.1"
+    # HTTP/1.1 keep-alive（2026-11-12）：默认 1.0 每个响应都断连，桌宠设备
+    # 每轮 500ms 推流都要重做 TCP 握手——实测中位 431ms、最大 3.5s、26 次
+    # 连接失败，全部是字幕丢词窗口。长连接后设备端往返应回落到 ~100ms 级。
+    # 所有响应都已带 Content-Length，满足 1.1 的必填要求。
+    protocol_version = "HTTP/1.1"
 
     @property
     def service(self) -> HubService:
