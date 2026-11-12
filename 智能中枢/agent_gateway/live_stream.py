@@ -99,6 +99,19 @@ def _contains_clear(text: str) -> bool:
     return any(word in text for word in _CLEAR_WORDS)
 
 
+def _normalize_samples(samples: List[int]) -> List[int]:
+    """每段峰值归一化到 -6dBFS（上限 ×20）。
+
+    设备推的是原始电平，用户小声说话只有 -32~-36dBFS，流式引擎对这种
+    弱信号直接「听不到」。纯底噪（峰值 <200）不放大，避免抬成幻觉语音。
+    """
+    peak = max(abs(s) for s in samples) if samples else 0
+    if 200 <= peak < 16000:
+        gain = min(16000.0 / peak, 20.0)
+        return [max(-32768, min(32767, int(s * gain))) for s in samples]
+    return samples
+
+
 def feed_pcm(device_id: str, pcm_bytes: bytes) -> None:
     """设备推来的 16k 单声道 s16le PCM → 喂流式引擎并增量解码。
 
@@ -119,11 +132,9 @@ def feed_pcm(device_id: str, pcm_bytes: bytes) -> None:
         if n == 0:
             return
         samples = list(struct.unpack(f"<{n}h", pcm_bytes[: n * 2]))
-        peak = max(abs(s) for s in samples) if samples else 0
-        if 200 <= peak < 16000:  # 真人声量级：拉到 -6dBFS；底噪与正常响度不动
-            gain = min(16000.0 / peak, 20.0)
-            samples = [max(-32768, min(32767, int(s * gain))) for s in samples]
+        samples = _normalize_samples(samples)
         stream = session["stream"]
+        # 必须归一到 [-1, 1] 浮点：整型直喂振幅超万倍，识别直接乱码
         stream.accept_waveform(_PCM_RATE, [s / 32768.0 for s in samples])
         while recognizer.is_ready(stream):
             recognizer.decode_stream(stream)
@@ -141,13 +152,24 @@ def feed_pcm(device_id: str, pcm_bytes: bytes) -> None:
 def _finalize_utterance(
     device_id: str, session: dict, recognizer
 ) -> None:
-    """停顿/超长：partial 定稿一行，缓冲音频交千问精转后原地替换。"""
+    """停顿/超长：partial 定稿一行，缓冲音频交千问精转后原地替换。
+
+    句首丢字修复（2026-11-12）：endpoint 重置时，触发块里可能混着用户
+    刚开口的下一句开头（transducer 出 token 滞后于音频几百毫秒，重置会
+    把这些未解码帧扔掉——实测「前面的字就大概率掉」只剩后半）。
+    对策：重置后把最后 1.2s 音频重新喂进新流——按 endpoint 定义这段是
+    尾部静音（重喂产出零 token，无害）；若里面混着下一句开头，字就活了。
+    """
     partial = session.get("partial") or ""
     pcm = bytes(session["utterance_pcm"])
     if recognizer.is_endpoint(session["stream"]):
         recognizer.reset(session["stream"])
     session["partial"] = ""
     session["utterance_pcm"] = bytearray()
+
+    # 每句音频落盘（保留最近 20 条）：用户报丢词时，直接听原始录音就能
+    # 分清是「采集端丢了」还是「识别模型吞了」——定位不再靠猜。
+    _dump_utterance_pcm(pcm)
 
     if _contains_clear(partial):
         session["utterances"] = []  # 清屏重新开始
@@ -157,9 +179,21 @@ def _finalize_utterance(
     if partial:
         session["utterances"].append(partial)
 
-    # 每句音频落盘（保留最近 20 条）：用户报丢词时，直接听原始录音就能
-    # 分清是「采集端丢了」还是「识别模型吞了」——定位不再靠猜。
-    _dump_utterance_pcm(pcm)
+    # 尾部 1.2s 重喂（见上注释）：救回卡在重置窗口里的下一句开头
+    tail = pcm[-int(_PCM_RATE * 1.2) * 2:]
+    if tail:
+        n = len(tail) // 2
+        tail_samples = _normalize_samples(
+            list(struct.unpack(f"<{n}h", tail))
+        )
+        stream = session["stream"]
+        stream.accept_waveform(
+            _PCM_RATE, [s / 32768.0 for s in tail_samples]
+        )
+        while recognizer.is_ready(stream):
+            recognizer.decode_stream(stream)
+        session["partial"] = str(recognizer.get_result(stream) or "").strip()
+        session["utterance_pcm"] = bytearray(tail)
 
     # 音频太短（<0.4s）多半是噪声碎片，不值得花一次精转
     if len(pcm) < _PCM_RATE * 2 * 0.4 or not pcm:
