@@ -11,6 +11,7 @@
 - partial/定稿文本命中 退下/清屏 → 清空会话重新开始。
 """
 
+import math
 import struct
 import threading
 import time
@@ -31,6 +32,11 @@ _sessions: Dict[str, dict] = {}
 _finalize_pool = None  # 千问精转的后台线程池（懒建）
 
 _CLEAR_WORDS = ("退下", "清屏", "清空", "别说了", "停下吧")
+
+# 音量门控（2026-11-12）：增益放大后远场人声/电视也进识别，流式引擎对这种
+# 音频大量幻觉。近场说话实测 rms -14~-28dBFS，远场 -30~-40dBFS。
+_SPEAK_RMS_DBFS = -35.0     # 单块判定「近处有人说话」（partial 显示门控）
+_MIN_UTTERANCE_RMS = -33.0  # 整句低于此 = 远场噪声：不上屏、不精转、不判清屏
 
 
 def is_available() -> bool:
@@ -104,14 +110,34 @@ def _write_rows(session: dict, start_row: int, pieces: List[str]) -> int:
     return len(pieces)
 
 
-def reset_session(device_id: str) -> None:
+def reset_session(device_id: str, reason: str = "") -> None:
     with _lock:
+        print(
+            f"[{time.strftime('%H:%M:%S')}] [LIVE] 会话重置 device={device_id} "
+            f"reason={reason or '未标注'}",
+            flush=True,
+        )
         _sessions.pop(device_id, None)
         _new_stream(device_id)
 
 
 def _contains_clear(text: str) -> bool:
-    return any(word in text for word in _CLEAR_WORDS)
+    """清屏指令判定（收紧版）：只认 ≤12 字的短句——长句/乱码里混到清屏词
+    一律不算，否则远场幻听能把整屏字幕误清掉。"""
+    t = str(text or "").strip().strip("。.，,！!？? ")
+    if not t or len(t) > 12:
+        return False
+    return any(word in t for word in _CLEAR_WORDS)
+
+
+def _rms_dbfs(pcm_bytes: bytes) -> float:
+    """整段 PCM 的 RMS 电平（dBFS）。空音频返回 -99。"""
+    n = len(pcm_bytes) // 2
+    if n == 0:
+        return -99.0
+    samples = struct.unpack(f"<{n}h", pcm_bytes[: n * 2])
+    rms = math.sqrt(sum(s * s for s in samples) / n)
+    return 20 * math.log10(rms / 32768) if rms > 0 else -99.0
 
 
 def _normalize_samples(samples: List[int]) -> List[int]:
@@ -146,8 +172,13 @@ def feed_pcm(device_id: str, pcm_bytes: bytes) -> None:
         n = len(pcm_bytes) // 2
         if n == 0:
             return
-        samples = list(struct.unpack(f"<{n}h", pcm_bytes[: n * 2]))
-        samples = _normalize_samples(samples)
+        raw = struct.unpack(f"<{n}h", pcm_bytes[: n * 2])
+        # 原始电平判定「近处有人说话」：必须在归一化之前算（归一化会抹掉音量差）
+        raw_rms = math.sqrt(sum(s * s for s in raw) / n)
+        raw_rms_db = 20 * math.log10(raw_rms / 32768) if raw_rms > 0 else -99.0
+        if raw_rms_db >= _SPEAK_RMS_DBFS:
+            session["last_speech_ts"] = time.time()
+        samples = _normalize_samples(list(raw))
         stream = session["stream"]
         # 必须归一到 [-1, 1] 浮点：整型直喂振幅超万倍，识别直接乱码
         stream.accept_waveform(_PCM_RATE, [s / 32768.0 for s in samples])
@@ -182,12 +213,31 @@ def _finalize_utterance(
     session["partial"] = ""
     session["utterance_pcm"] = bytearray()
 
+    # 远场噪声防线：整句能量低于 -33dBFS = 房间远处的说话/电视。增益放大
+    # 后这种音频被流式引擎大量幻听（用户实测连不成句 + 乱码行），不上屏、
+    # 不精转、不判清屏——只在日志里留痕。
+    rms_db = _rms_dbfs(pcm)
+    if rms_db < _MIN_UTTERANCE_RMS:
+        print(
+            f"[{time.strftime('%H:%M:%S')}] [LIVE] 远场噪声句丢弃 "
+            f"rms={rms_db:.1f}dBFS partial={partial!r}",
+            flush=True,
+        )
+        return
+
     # 每句音频落盘（保留最近 20 条）：用户报丢词时，直接听原始录音就能
     # 分清是「采集端丢了」还是「识别模型吞了」——定位不再靠猜。
     _dump_utterance_pcm(pcm)
 
+    print(
+        f"[{time.strftime('%H:%M:%S')}] [LIVE] 定稿 rms={rms_db:.1f}dBFS "
+        f"text={partial!r}",
+        flush=True,
+    )
+
     if _contains_clear(partial):
         # 清屏重新开始：行槽、行位计数、句列表全部归零
+        print(f"[{time.strftime('%H:%M:%S')}] [LIVE] 命中清屏指令", flush=True)
         session["utterances"] = []
         session["slots"] = []
         session["rows"] = [None] * 16
@@ -384,9 +434,13 @@ def current_frame(device_id: str) -> bytes:
         rows: List[Optional[str]] = list(session["rows"])
         next_row: int = session["next_row"]
         partial: str = session.get("partial") or ""
+        # partial 显示门控：近处 1.5s 内没出现过响亮人声，partial 多半是
+        # 远场噪声幻听——不上屏（定稿行槽不受影响）。
+        last_speech = session.get("last_speech_ts") or 0
+        show_partial = (time.time() - last_speech) < 1.5
 
     highlight = None
-    if partial:
+    if partial and show_partial:
         # 正在说的话写到下一空行起（只影响渲染，不动行槽；定稿时才落槽）
         pieces = wrap_text(partial)
         for offset, piece in enumerate(pieces):
