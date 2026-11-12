@@ -1997,23 +1997,104 @@ void upload_wav_to_hub(const char* session_mode = "conversation") {
   submit_captured_wav_to_hub(session_mode);
 }
 
-// ---------------- 实时转写模式（2026-11-11） ----------------
-// 表情撤掉，屏幕变成字幕屏：设备把每段话传给中枢本地识别（SenseVoice），
-// 中枢把累积文本渲染成 240x240 RGB565 整帧回传，设备直接贴屏。
-// 不进意图管线、不回语音——屏幕就是唯一出口。
+// ---------------- 实时字幕流式模式（2026-11-12 三版） ----------------
+// 真·流式：设备每 600ms 把 PCM 原样推给中枢（不建 wav、不等静音、不轮询
+// request），中枢用流式 zipformer 增量解码出 partial 文字实时上屏；停顿
+// 1.2s 一句说完，后台把这句音频交千问 ASR 精转后原地替换那行字。
+// 表情撤掉，屏幕全程字幕。不进意图管线、不回语音。
 
 constexpr size_t kLiveFrameBytes = 240UL * 240UL * 2UL;
-uint8_t* live_frame_buffer = nullptr;  // PSRAM，115KB
+constexpr size_t kStreamChunkFrames = 9600;  // 600ms @ 16k
+uint8_t* live_frame_buffer = nullptr;        // PSRAM，115KB
 
-bool fetch_and_draw_live_frame(const String& request_id) {
-  const String url = String(SPARKBOT_HUB_BASE_URL) +
-                     "/api/v1/portable/v1/requests/" + request_id + "/frame";
+bool live_stream_reset() {
   WiFiClient client;
   HTTPClient http;
+  const String url = String(SPARKBOT_HUB_BASE_URL) +
+                     "/api/v1/portable/v1/live/reset?device_id=" +
+                     SPARKBOT_DEVICE_ID;
   if (!http.begin(client, url)) {
     return false;
   }
-  http.setTimeout(10000);
+  http.setTimeout(5000);
+  const int code = http.POST(String(""));
+  http.end();
+  return code == 200;
+}
+
+// 连续读够 frames 帧的左声道，不判定 VAD——流式引擎自己处理静音与停顿。
+// 中途不清 DMA：上传/拉帧空档期的音频全在 ring（64 档 ≈ 1s）里，下一块
+// 从头读出，无缝衔接。失败返回 false（调用方重试）。
+bool capture_pcm_block(int16_t* dst, size_t frames) {
+  if (wav_mono_buffer == nullptr) {
+    return false;
+  }
+  if (!start_i2s(I2S_MODE_RX)) {
+    return false;
+  }
+  if (!codec_adc_ready) {
+    if (!configure_codec_for_adc()) {
+      Serial.println("[LIVE] ES8311 configuration failed; stopping I2S");
+      stop_i2s();
+      return false;
+    }
+    codec_adc_ready = true;
+    delay(100);
+  }
+  size_t got_frames = 0;
+  while (got_frames < frames) {
+    size_t bytes_read = 0;
+    const esp_err_t read_error = i2s_read(
+        kI2sPort,
+        capture_buffer,
+        sizeof(capture_buffer),
+        &bytes_read,
+        pdMS_TO_TICKS(1000));
+    if (read_error != ESP_OK || bytes_read < sizeof(int16_t) * 2) {
+      Serial.printf("[LIVE] capture failed: %s bytes=%u\n",
+                    esp_err_to_name(read_error),
+                    static_cast<unsigned int>(bytes_read));
+      stop_i2s();
+      return false;
+    }
+    const size_t chunk = min(
+        bytes_read / (sizeof(int16_t) * 2), frames - got_frames);
+    for (size_t index = 0; index < chunk; ++index) {
+      dst[got_frames + index] = capture_buffer[index * 2];  // 左声道
+    }
+    got_frames += chunk;
+  }
+  return true;
+}
+
+bool live_stream_post(const int16_t* mono, size_t frames) {
+  WiFiClient client;
+  HTTPClient http;
+  const String url = String(SPARKBOT_HUB_BASE_URL) +
+                     "/api/v1/portable/v1/live/stream?device_id=" +
+                     SPARKBOT_DEVICE_ID;
+  if (!http.begin(client, url)) {
+    return false;
+  }
+  http.setTimeout(8000);
+  http.addHeader("Content-Type", "application/octet-stream");
+  const int code = http.POST(
+      const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(mono)),
+      frames * sizeof(int16_t));
+  http.end();
+  return code == 200;
+}
+
+bool live_fetch_stream_frame() {
+  WiFiClient client;
+  HTTPClient http;
+  const String url = String(SPARKBOT_HUB_BASE_URL) +
+                     "/api/v1/portable/v1/live/frame?device_id=" +
+                     SPARKBOT_DEVICE_ID;
+  if (!http.begin(client, url)) {
+    return false;
+  }
+  http.setTimeout(8000);
   const int code = http.GET();
   if (code != 200) {
     http.end();
@@ -2044,9 +2125,6 @@ bool fetch_and_draw_live_frame(const String& request_id) {
   }
   http.end();
   if (received != kLiveFrameBytes) {
-    Serial.printf("[LIVE] frame short read: %u/%u\n",
-                  static_cast<unsigned>(received),
-                  static_cast<unsigned>(kLiveFrameBytes));
     return false;
   }
   // 大端 RGB565：uint8 强转 uint16 后 pushImage 的字节交换正好补回 LCD 要的序
@@ -2055,63 +2133,8 @@ bool fetch_and_draw_live_frame(const String& request_id) {
   return true;
 }
 
-bool submit_live_chunk(String& transcript, bool& sleep_now) {
-  transcript = "";
-  sleep_now = false;
-  build_wav_file();
-  const unsigned long gap_started = millis();  // 空档起点：本段采集结束→下段开始
-  if (!connect_wifi_for_upload()) {
-    return false;
-  }
-  String media_id;
-  if (!post_audio_to_hub(media_id)) {
-    return false;
-  }
-  const unsigned long upload_ms = millis() - gap_started;
-  String request_id;
-  if (!submit_audio_request(media_id, "live", request_id)) {
-    return false;
-  }
-  const String url = String(SPARKBOT_HUB_BASE_URL) +
-                     "/api/v1/portable/v1/requests/" + request_id;
-  const unsigned long deadline = millis() + 15000;
-  while (millis() < deadline) {
-    WiFiClient client;
-    HTTPClient http;
-    if (!http.begin(client, url)) {
-      return false;
-    }
-    http.setTimeout(10000);
-    const int code = http.GET();
-    const String response = http.getString();
-    http.end();
-    if (code != 200) {
-      return false;
-    }
-    DynamicJsonDocument document(4096);
-    if (deserializeJson(document, response) != DeserializationError::Ok) {
-      return false;
-    }
-    const String state = document["state"].as<String>();
-    if (state == "completed" || state == "succeeded" || state == "failed") {
-      transcript = document["transcript"].as<String>();
-      sleep_now = document["session_action"].as<String>() == "sleep";
-      fetch_and_draw_live_frame(request_id);
-      // 空档 = 上传+提交+轮询到 completed 的总时长；DMA ring 只有 1s，
-      // 空档超过 1s 的部分就是丢词量——这条日志用来核对 ring 够不够。
-      Serial.printf("[LIVE] gap=%lums (upload=%lums) transcript=%s\n",
-                    millis() - gap_started, upload_ms, transcript.c_str());
-      return true;
-    }
-    delay(100);
-  }
-  Serial.println("[LIVE] request polling timed out");
-  return false;
-}
-
-// 实时转写态：字幕屏（2026-11-11 二版）。
-// 免唤醒、屏幕常亮、上电即开始——说「退下/清屏」清空字幕重新开始。
-// 永不熄屏、永不回待机，只有串口打断才返回。返回值仅反映退出原因。
+// 实时字幕态（常驻）：免唤醒、屏幕常亮。说「退下/清屏」中枢清字幕继续。
+// 只有串口打断才返回。
 bool run_live_transcription() {
   face::suspend();  // 表情撤掉：屏幕全程交给转写文字
   if (!face::ready()) {
@@ -2119,33 +2142,30 @@ bool run_live_transcription() {
   }
   screen_bus::set_backlight(true);
   screen_bus::tft().fillScreen(0x0841);  // 与中枢帧背景同色（8,14,32）
-  Serial.println("[LIVE] live subtitle mode; say 退下/清屏 to clear");
+  Serial.println("[LIVE] streaming subtitle mode; say 退下/清屏 to clear");
+  if (!live_stream_reset()) {
+    Serial.println("[LIVE] hub unreachable; will retry on stream");
+  }
+  int frame_tick = 0;
   while (true) {
     if (Serial.available() > 0) {
       Serial.println("[LIVE] interrupted by serial input");
       return false;
     }
-    last_session_action = "";
-    // 丢词修复（2026-11-11）：上传+识别的约 1s 空档里用户还在说话，这段
-    // 音频压在 DMA 环形缓冲（64×256 帧 ≈ 1s）里。绝不能清缓冲——清了
-    // 空档期说的整段蒸发（实测症状：句子中段缺失）。clear_dma=false 让
-    // 下一轮从 ring 无缝续读；长句超 4s 被切段时尾巴同样由下一轮接走。
-    if (!capture_until_silence(4, 4, kWakeVadThreshold, 0, 2, 0, false)) {
-      continue;  // 没人说话：继续听，屏幕保持常亮
-    }
-    // 裁掉轮首静音（留 0.2s 句首保护垫防声母被切），trim 内部顺带做峰值归一化
-    trim_capture_to_speech_onset();
-    String transcript;
-    bool clear_screen = false;
-    if (!submit_live_chunk(transcript, clear_screen)) {
-      Serial.println("[LIVE] hub unreachable; retry in 2s");
-      delay(2000);
+    // ① 连续采 600ms PCM（ring 无缝，不丢空档音频）
+    if (!capture_pcm_block(wav_mono_buffer, kStreamChunkFrames)) {
+      delay(200);
       continue;
     }
-    if (clear_screen) {
-      // 中枢已清空缓冲，本地同步清屏（不熄屏，继续转写）
-      Serial.println("[LIVE] clear requested; subtitles reset");
-      screen_bus::tft().fillScreen(0x0841);
+    // ② 推给中枢流式解码（响应很快，不做整段识别）
+    if (!live_stream_post(wav_mono_buffer, kStreamChunkFrames)) {
+      Serial.println("[LIVE] hub unreachable; retry in 1s");
+      delay(1000);
+      continue;
+    }
+    // ③ 隔轮拉一次字幕帧（115KB 全帧 ≈ 0.3s，隔轮摊薄，留足 ring 余量）
+    if (++frame_tick % 2 == 0) {
+      live_fetch_stream_frame();
     }
   }
 }

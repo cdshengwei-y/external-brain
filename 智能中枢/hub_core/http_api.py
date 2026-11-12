@@ -10,6 +10,7 @@ from .errors import HubError, ValidationError
 from .models import TERMINAL_COMMAND_STATES
 from agent_gateway.device import VOLUME_GAINS
 from agent_gateway import host_control
+from agent_gateway import live_stream
 from agent_gateway.portable import PortableRequestService
 from .service import HubService
 
@@ -233,6 +234,12 @@ class HubRequestHandler(BaseHTTPRequestHandler):
             if parsed.path == "/api/v1/host/log":
                 self._send_json(200, {"actions": host_control.recent(50)})
                 return
+            if parsed.path == "/api/v1/portable/v1/live/frame":
+                device_id = parse_qs(parsed.query).get("device_id", [""])[0]
+                if not device_id:
+                    raise ValidationError("device_id 必须是非空字符串")
+                self._send_binary(200, live_stream.current_frame(device_id), "application/octet-stream")
+                return
             if parsed.path.startswith("/api/v1/portable/v1/requests/") and parsed.path.endswith("/audio"):
                 request_id = parsed.path.rstrip("/").split("/")[-2]
                 audio, content_type = self.portable_service.get_audio(request_id)
@@ -311,6 +318,22 @@ class HubRequestHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         parsed = urlsplit(self.path)
         try:
+            if parsed.path == "/api/v1/portable/v1/live/stream":
+                # 实时字幕流：设备每 ~600ms 推一段 16k mono PCM（原始字节）
+                device_id = parse_qs(parsed.query).get("device_id", [""])[0]
+                if not device_id:
+                    raise ValidationError("device_id 必须是非空字符串")
+                data = self._read_binary_body()
+                live_stream.feed_pcm(device_id, data)
+                self._send_json(200, {"ok": True})
+                return
+            if parsed.path == "/api/v1/portable/v1/live/reset":
+                device_id = parse_qs(parsed.query).get("device_id", [""])[0]
+                if not device_id:
+                    raise ValidationError("device_id 必须是非空字符串")
+                live_stream.reset_session(device_id)
+                self._send_json(200, {"ok": True})
+                return
             if parsed.path == "/api/v1/host/exec":
                 payload = self._read_json_body()
                 action = str(payload.get("action") or "").strip()
