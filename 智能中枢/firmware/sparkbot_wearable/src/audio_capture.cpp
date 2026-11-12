@@ -2070,35 +2070,54 @@ bool capture_pcm_block(int16_t* dst, size_t frames) {
 }
 
 bool live_stream_post(const int16_t* mono, size_t frames) {
-  WiFiClient client;
-  HTTPClient http;
+  // 连接复用（2026-11-12）：每轮新建 TCP 要多花 50~150ms 握手，500ms 的
+  // 采音块配一秒级空档就是丢词。静态 client + setReuse 保住长连接。
+  static WiFiClient client;
+  static HTTPClient http;
+  static bool reuse_ready = false;
   const String url = String(SPARKBOT_HUB_BASE_URL) +
                      "/api/v1/portable/v1/live/stream?device_id=" +
                      SPARKBOT_DEVICE_ID;
   if (!http.begin(client, url)) {
+    reuse_ready = false;
     return false;
+  }
+  if (!reuse_ready) {
+    http.setReuse(true);
+    reuse_ready = true;
   }
   http.setTimeout(8000);
   http.addHeader("Content-Type", "application/octet-stream");
   const int code = http.POST(
       const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(mono)),
       frames * sizeof(int16_t));
+  if (code != 200) {
+    reuse_ready = false;  // 连接可能已坏，下一轮重建
+  }
   http.end();
   return code == 200;
 }
 
 bool live_fetch_stream_frame() {
-  WiFiClient client;
-  HTTPClient http;
+  // 同样走连接复用（GET 与 POST 各自持有连接）
+  static WiFiClient client;
+  static HTTPClient http;
+  static bool reuse_ready = false;
   const String url = String(SPARKBOT_HUB_BASE_URL) +
                      "/api/v1/portable/v1/live/frame?device_id=" +
                      SPARKBOT_DEVICE_ID;
   if (!http.begin(client, url)) {
+    reuse_ready = false;
     return false;
+  }
+  if (!reuse_ready) {
+    http.setReuse(true);
+    reuse_ready = true;
   }
   http.setTimeout(8000);
   const int code = http.GET();
   if (code != 200) {
+    reuse_ready = false;
     http.end();
     return false;
   }
@@ -2163,19 +2182,23 @@ bool run_live_transcription() {
       Serial.println("[LIVE] interrupted by serial input");
       return false;
     }
-    // ① 连续采 600ms PCM（ring 无缝，不丢空档音频）
+    // ① 连续采 500ms PCM（ring 无缝，不丢空档音频）
     if (!capture_pcm_block(wav_mono_buffer, kStreamChunkFrames)) {
       delay(200);
       continue;
     }
     // ② 推给中枢流式解码（响应很快，不做整段识别）
+    const unsigned long http_started = millis();
     if (!live_stream_post(wav_mono_buffer, kStreamChunkFrames)) {
       Serial.println("[LIVE] hub unreachable; retry in 1s");
       delay(1000);
       continue;
     }
-    // ③ 每轮都拉字幕帧（差量下发只有几 KB，~50ms）——上屏节奏 ~0.7s
+    // ③ 每轮都拉字幕帧（差量下发只有几 KB）——上屏节奏 ~0.7s
     live_fetch_stream_frame();
+    // 每轮 HTTP 总耗时 = 空档期音频量；超过 ~1s（ring 容量）就会丢词，
+    // 这条日志是丢词诊断的第一证据。
+    Serial.printf("[LIVE] http=%lums\n", millis() - http_started);
   }
 }
 

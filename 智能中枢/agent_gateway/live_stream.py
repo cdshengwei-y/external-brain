@@ -157,12 +157,76 @@ def _finalize_utterance(
     if partial:
         session["utterances"].append(partial)
 
-    # 音频太短（<0.4s）多半是噪声碎片，不值得花一次千问
+    # 每句音频落盘（保留最近 20 条）：用户报丢词时，直接听原始录音就能
+    # 分清是「采集端丢了」还是「识别模型吞了」——定位不再靠猜。
+    _dump_utterance_pcm(pcm)
+
+    # 音频太短（<0.4s）多半是噪声碎片，不值得花一次精转
     if len(pcm) < _PCM_RATE * 2 * 0.4 or not pcm:
         return
+
+    # 第一精转：本地 SenseVoice（2026-11-12）。0.1s 级、离线、必成功——
+    # zipformer 14M 在真实噪声下爱吞词，停顿时用 SenseVoice 整句重转一遍，
+    # 丢掉的词当场补回来。千问（第二精转，后台）可用时再升一次精度。
+    refined = partial
+    try:
+        from agent_gateway import local_asr
+
+        if local_asr.is_available():
+            sense_text = local_asr.transcribe_pcm(pcm).strip()
+            if (
+                sense_text
+                and not _contains_clear(sense_text)
+                and _looks_like_refinement(partial, sense_text)
+            ):
+                session["utterances"][utterance_index] = sense_text
+                refined = sense_text
+                print(
+                    f"[{time.strftime('%H:%M:%S')}] [LIVE] SenseVoice 精转 "
+                    f"#{utterance_index}: {partial!r} -> {sense_text!r}",
+                    flush=True,
+                )
+    except Exception as error:  # noqa: BLE001 - 精转失败保留粗字
+        print(f"[LIVE] SenseVoice 精转失败：{error}", flush=True)
+
+    # 第二精转：千问（后台线程，网络调用；成功且像修正时再替换一次）
     _get_finalize_pool().submit(
-        _finalize_with_qwen, device_id, utterance_index, partial, pcm
+        _finalize_with_qwen, device_id, utterance_index, refined, pcm
     )
+
+
+_DUMP_DIR = Path(".data/live_dump")
+
+
+def _dump_utterance_pcm(pcm: bytes) -> None:
+    """把定稿句的原始音频存成 wav，最多保留 20 条（诊断丢词用）。"""
+    try:
+        out = _DUMP_DIR
+        out.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%H%M%S")
+        path = out / f"utt_{stamp}_{len(pcm) // 32000}.wav"
+        with open(path, "wb") as handle:
+            handle.write(
+                b"RIFF"
+                + (len(pcm) + 36).to_bytes(4, "little")
+                + b"WAVEfmt "
+                + (16).to_bytes(4, "little")
+                + (1).to_bytes(2, "little")
+                + (1).to_bytes(2, "little")
+                + (_PCM_RATE).to_bytes(4, "little")
+                + (_PCM_RATE * 2).to_bytes(4, "little")
+                + (2).to_bytes(2, "little")
+                + (16).to_bytes(2, "little")
+                + b"data"
+                + len(pcm).to_bytes(4, "little")
+            )
+            handle.write(pcm)
+        # 只留最近 20 条
+        dumps = sorted(out.glob("utt_*.wav"))
+        for old in dumps[:-20]:
+            old.unlink(missing_ok=True)
+    except OSError:
+        pass  # 诊断落盘失败不影响主链路
 
 
 def _finalize_with_qwen(
