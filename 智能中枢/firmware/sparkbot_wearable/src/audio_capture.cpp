@@ -2103,9 +2103,10 @@ bool live_fetch_stream_frame() {
   static WiFiClient client;
   static HTTPClient http;
   static bool reuse_ready = false;
+  static bool need_full = false;  // 拉帧失败后差量基线失步，要求中枢整屏重发
   const String url = String(SPARKBOT_HUB_BASE_URL) +
                      "/api/v1/portable/v1/live/frame?device_id=" +
-                     SPARKBOT_DEVICE_ID;
+                     SPARKBOT_DEVICE_ID + (need_full ? "&full=1" : "");
   if (!http.begin(client, url)) {
     reuse_ready = false;
     return false;
@@ -2118,12 +2119,14 @@ bool live_fetch_stream_frame() {
   const int code = http.GET();
   if (code != 200) {
     reuse_ready = false;
+    need_full = true;
     http.end();
     return false;
   }
   const int len = http.getSize();
   if (len <= 0 || len > static_cast<int>(kLiveDiffMaxBytes)) {
     http.end();
+    need_full = true;
     return false;
   }
   if (live_frame_buffer == nullptr) {
@@ -2146,8 +2149,10 @@ bool live_fetch_stream_frame() {
   }
   http.end();
   if (received != static_cast<size_t>(len)) {
+    need_full = true;
     return false;
   }
+  need_full = false;  // 本次成功，差量基线重新同步
   // 差量格式：[行数 1B] + N×[行号 1B + 7200B 行数据（大端 RGB565）]
   // 行号 0..15 对应屏幕 y = 行号×15px；只贴变化的行，全帧 115KB 的时代过去了
   const uint8_t count = live_frame_buffer[0];

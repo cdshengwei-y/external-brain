@@ -235,11 +235,13 @@ class HubRequestHandler(BaseHTTPRequestHandler):
                 self._send_json(200, {"actions": host_control.recent(50)})
                 return
             if parsed.path == "/api/v1/portable/v1/live/frame":
-                device_id = parse_qs(parsed.query).get("device_id", [""])[0]
+                query = parse_qs(parsed.query)
+                device_id = query.get("device_id", [""])[0]
                 if not device_id:
                     raise ValidationError("device_id 必须是非空字符串")
+                full = query.get("full", ["0"])[0] == "1"
                 # 按行差量下发（1B 行数 + N×(1B 行号+行数据)），拉帧耗时 ~50ms
-                self._send_binary(200, live_stream.frame_diff(device_id), "application/octet-stream")
+                self._send_binary(200, live_stream.frame_diff(device_id, full=full), "application/octet-stream")
                 return
             if parsed.path.startswith("/api/v1/portable/v1/requests/") and parsed.path.endswith("/audio"):
                 request_id = parsed.path.rstrip("/").split("/")[-2]

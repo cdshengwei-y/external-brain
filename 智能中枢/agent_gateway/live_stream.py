@@ -56,8 +56,10 @@ def _get_recognizer():
         joiner=str(_MODEL_DIR / "joiner-epoch-99-avg-1.int8.onnx"),
         num_threads=2,
         enable_endpoint_detection=True,
-        rule1_min_trailing_silence=2.4,
-        rule2_min_trailing_silence=1.2,
+        rule1_min_trailing_silence=2.0,
+        # 1.2→1.0s：endpoint 越早触发，重置越早完成，用户在重置窗口里
+        # 开口的竞态概率越小（实测句首丢字集中发生在 1.2~1.5s 停顿后）
+        rule2_min_trailing_silence=1.0,
         rule3_min_utterance_length=20.0,
     )
     return _recognizer
@@ -361,16 +363,18 @@ _ROW_BYTES = live_screen.FRAME_WIDTH * _ROW_HEIGHT * 2  # 7200B
 _FRAME_ROWS = live_screen.FRAME_HEIGHT // _ROW_HEIGHT  # 16
 
 
-def frame_diff(device_id: str) -> bytes:
+def frame_diff(device_id: str, full: bool = False) -> bytes:
     """相对上一帧只回变化的行：1 字节行数 + N×(1 字节行号 + 7200B 行数据)。
 
     整帧 115KB 走一遍要 0.3s+，而每轮变化通常只有 1~3 行——按行差量下发
     后拉帧从 ~0.3s 缩到 ~50ms，设备可以每轮都拉，字幕上屏节奏翻倍。
+    full=True（设备拉帧失败后主动要求）忽略差量基线，整屏重发，防止设备
+    错过一帧后画面永久错位。
     """
     frame = current_frame(device_id)
     with _lock:
         session = _sessions.get(device_id)
-        last = session.get("last_frame") if session else None
+        last = None if full else (session.get("last_frame") if session else None)
         if session is not None:
             session["last_frame"] = frame
     rows = bytearray()
