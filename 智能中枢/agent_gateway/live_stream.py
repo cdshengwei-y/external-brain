@@ -217,15 +217,24 @@ def feed_pcm(device_id: str, pcm_bytes: bytes) -> None:
             _finalize_utterance(device_id, session, recognizer)
 
 
-def _wake_hit(text: str) -> bool:
-    """流式 partial 里是否出现唤醒词。
+# 同音字集（2026-11-12）：用户实测「贾维斯」被听成 价位/假卫诗/加微/家里斯/
+# 较为/贾维师 等——逐个硬编码追不完，改用三个同音字集 + 邻接规则覆盖。
+_JIA_CHARS = "贾家假加价甲架嘉佳驾稼叫较教交角"
+_WEI_CHARS = "维威伟为卫微位围唯委韦未味喂魏纬"
+# 与「维/威/伟」相邻的 sī/shī 字（为什么的「什」不在此列，防高频误触）
+_SI_ADJ_CHARS = "斯师诗士司丝私"
+# 「贾_ _斯」隔一字规则用的 sī/shī 字（距离=2，假释/加斯这类贴邻不触发）
+_SI_FAR_CHARS = "斯师士诗司使史市石时"
 
-    两层匹配：
-    1. 完整词：复用中枢的模糊匹配表（贾维斯/查维斯/假威斯…全变体）；
-    2. 碎片匹配（2026-11-12）：流式解码常把名字拆成两字碎片——实测
-       「叫维」「家为师」「假为师」都是「贾维斯」的半截。姓字×名字字
-       的二元组（贾/家/假/加/叫…×维/威/伟/为）与 名字字×尾字
-       （维/威/伟×斯/师）都算命中。「拉斯维加斯」这类不匹配（顺序反）。
+def _wake_hit(text: str) -> bool:
+    """流式 partial / 定稿文本里是否出现唤醒词「贾维斯」。
+
+    三层匹配：
+    1. 完整词：复用中枢的模糊匹配表（贾维斯/查维斯/假威斯/觉的…全变体）；
+    2. 邻接同音对：贾系字+维系字 相邻，或 维系字+斯系字 相邻（价位/假卫诗/
+       加微/较为/贾维师 全覆盖）；「为什么」不含维系相邻对，不误触；
+    3. 跨字规则：贾系字与斯系字隔一个字（家里斯）。
+    「拉斯维加斯」「我觉得可以」实测不误触。
     """
     text = str(text or "")
     try:
@@ -236,16 +245,19 @@ def _wake_hit(text: str) -> bool:
     except Exception:  # noqa: BLE001
         if "贾维斯" in text:
             return True
-    heads = "贾加家假嘉叫佳甲驾价"
-    mids = "维威伟为"
-    for head in heads:
-        for mid in mids:
-            if head + mid in text:
-                return True
-    for mid in "维威伟":
-        for tail in "斯师士":
-            if mid + tail in text:
-                return True
+    chars = [c for c in text if "\u4e00" <= c <= "\u9fff"]
+    for i in range(len(chars) - 1):
+        first, second = chars[i], chars[i + 1]
+        if first in _JIA_CHARS and second in _WEI_CHARS:
+            return True
+        if first in _WEI_CHARS and second in _SI_ADJ_CHARS:
+            return True
+        if (
+            i + 2 < len(chars)
+            and first in _JIA_CHARS
+            and chars[i + 2] in _SI_FAR_CHARS
+        ):
+            return True
     return False
 
 
@@ -370,12 +382,7 @@ def _finalize_utterance(
     # 3s 冷却与 partial 命中的那次滴声互斥，不会双响。
     now_ts = time.time()
     if refined and now_ts - session.get("last_beep_ts", 0) >= 3.0:
-        try:
-            from agent_gateway.portable import PortableRequestService
-
-            hit = PortableRequestService._is_wake_phrase(refined)
-        except Exception:  # noqa: BLE001
-            hit = "贾维斯" in refined
+        hit = _wake_hit(refined)
         if hit:
             session["beep_pending"] = True
             session["beep_armed"] = False
