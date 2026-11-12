@@ -1023,6 +1023,53 @@ void play_test_tone() {
   }
 }
 
+// 唤醒词命中提示音（2026-11-12）：0.5 秒 1kHz——用户说「贾维斯」，中枢
+// 流式识别一命中就回标志位，设备滴一声。说 N 次数 N 声即可测识别率。
+void play_wake_beep() {
+  stop_i2s();
+  codec_adc_ready = false;
+  if (!start_i2s(I2S_MODE_TX)) {
+    return;
+  }
+  if (!configure_codec_for_playback()) {
+    Serial.println("[LIVE] beep: ES8311 playback config failed");
+    stop_i2s();
+    return;
+  }
+  digitalWrite(kPowerAmpEnablePin, HIGH);
+  delay(20);
+
+  constexpr size_t kChunkSamples = 256;
+  constexpr size_t kBeepSamples = kSampleRate / 2;  // 0.5s
+  constexpr float kToneFrequency = 1000.0F;
+  constexpr float kAmplitude = 12000.0F;
+  int16_t tone_buffer[kChunkSamples];
+  size_t offset = 0;
+  while (offset < kBeepSamples) {
+    const size_t samples = min(kChunkSamples, kBeepSamples - offset);
+    for (size_t index = 0; index < samples; ++index) {
+      const float phase =
+          2.0F * PI * kToneFrequency * static_cast<float>(offset + index) /
+          static_cast<float>(kSampleRate);
+      tone_buffer[index] = static_cast<int16_t>(sinf(phase) * kAmplitude);
+    }
+    size_t bytes_written = 0;
+    const esp_err_t write_error = i2s_write(kI2sPort,
+                                            tone_buffer,
+                                            samples * sizeof(int16_t),
+                                            &bytes_written,
+                                            pdMS_TO_TICKS(1000));
+    if (write_error != ESP_OK || bytes_written != samples * sizeof(int16_t)) {
+      break;
+    }
+    offset += samples;
+  }
+  i2s_zero_dma_buffer(kI2sPort);
+  delay(30);
+  stop_i2s();  // 下轮 capture_pcm_block 会重装 RX 并重配 ADC
+  Serial.println("[LIVE] beep 0.5s");
+}
+
 // ── 唤醒音频裁剪：只把「最响的那一簇」传上去 ──────────────────────────
 // 待机窗口 3 秒，原来的做法是把这 3 秒整段上传（94252 字节）。但真正有内容的
 // 只有 0.9 秒，其余都是房间底噪。实测局域网 85~130 KB/s，94252 字节要
@@ -2153,10 +2200,12 @@ bool live_fetch_stream_frame() {
     return false;
   }
   need_full = false;  // 本次成功，差量基线重新同步
-  // 差量格式：[行数 1B] + N×[行号 1B + 7200B 行数据（大端 RGB565）]
+  // 差量格式：[flags 1B][行数 1B] + N×[行号 1B + 7200B 行数据（大端 RGB565）]
+  // flags bit0 = 唤醒词命中（中枢流式识别到贾维斯）→ 滴一声 0.5s
   // 行号 0..15 对应屏幕 y = 行号×15px；只贴变化的行，全帧 115KB 的时代过去了
-  const uint8_t count = live_frame_buffer[0];
-  size_t offset = 1;
+  const uint8_t flags = live_frame_buffer[0];
+  const uint8_t count = live_frame_buffer[1];
+  size_t offset = 2;
   for (uint8_t index = 0; index < count && offset + 1 + 7200UL <= received;
        ++index) {
     const uint8_t row = live_frame_buffer[offset];
@@ -2165,6 +2214,9 @@ bool live_fetch_stream_frame() {
         0, row * 15, 240, 15,
         reinterpret_cast<uint16_t*>(live_frame_buffer + offset));
     offset += 7200;
+  }
+  if (flags & 0x01) {
+    play_wake_beep();  // 中枢识别到「贾维斯」：滴一声（说 N 次数 N 声测识别率）
   }
   return true;
 }

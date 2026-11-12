@@ -97,6 +97,8 @@ def _new_stream(device_id: str) -> None:
             "partial": "",
             "utterance_pcm": bytearray(),
             "last_active": time.time(),
+            "beep_pending": False,  # 唤醒词命中 → 设备滴一声
+            "beep_armed": True,     # 每句只响一次，endpoint 重新武装
         },
     )
     recognizer = _get_recognizer()
@@ -188,12 +190,41 @@ def feed_pcm(device_id: str, pcm_bytes: bytes) -> None:
         partial = str(recognizer.get_result(stream) or "").strip()
         session["partial"] = partial
 
+        # 唤醒词命中探针（2026-11-12）：流式识别一命中「贾维斯」（含模糊
+        # 变体）就让设备滴一声 0.5s——用户用「说 N 次数 N 声」测识别率。
+        # 每句只响一次（endpoint 定稿后重新武装）+ 3 秒冷却：定稿后的尾部
+        # 重喂会把上一句尾巴重新解码成唤醒词片段，没有冷却会连响两声。
+        now_ts = time.time()
+        if (
+            session.get("beep_armed")
+            and partial
+            and now_ts - session.get("last_beep_ts", 0) >= 3.0
+            and _wake_hit(partial)
+        ):
+            session["beep_pending"] = True
+            session["beep_armed"] = False
+            session["last_beep_ts"] = now_ts
+            print(
+                f"[{time.strftime('%H:%M:%S')}] [LIVE] 唤醒词命中（设备将滴声）: {partial!r}",
+                flush=True,
+            )
+
         # 单句音频累计（供千问精转）；超 20s 强制定稿防内存无限涨
         session["utterance_pcm"].extend(pcm_bytes)
         max_pcm = int(_MAX_UTTERANCE_SECONDS * _PCM_RATE) * 2
         endpoint = recognizer.is_endpoint(stream)
         if endpoint or len(session["utterance_pcm"]) >= max_pcm:
             _finalize_utterance(device_id, session, recognizer)
+
+
+def _wake_hit(text: str) -> bool:
+    """流式 partial 里是否出现唤醒词（复用中枢的模糊匹配表与错听变体）。"""
+    try:
+        from agent_gateway.portable import PortableRequestService
+
+        return PortableRequestService._is_wake_phrase(text)
+    except Exception:  # noqa: BLE001 - 匹配器不可用时退回精确匹配
+        return "贾维斯" in str(text or "")
 
 
 def _finalize_utterance(
@@ -213,6 +244,7 @@ def _finalize_utterance(
         recognizer.reset(session["stream"])
     session["partial"] = ""
     session["utterance_pcm"] = bytearray()
+    session["beep_armed"] = True  # 句边界：重新武装滴声探针
 
     # 远场噪声防线：整句能量低于 -33dBFS = 房间远处的说话/电视。增益放大
     # 后这种音频被流式引擎大量幻听（用户实测连不成句 + 乱码行），不上屏、
@@ -464,8 +496,9 @@ _FRAME_ROWS = live_screen.FRAME_HEIGHT // _ROW_HEIGHT  # 16
 
 
 def frame_diff(device_id: str, full: bool = False) -> bytes:
-    """相对上一帧只回变化的行：1 字节行数 + N×(1 字节行号 + 7200B 行数据)。
+    """相对上一帧只回变化的行：[标志 1B][行数 1B] + N×(1B 行号 + 7200B 行数据)。
 
+    flags bit0 = 唤醒词命中（设备滴一声 0.5s）。取走即清零，一句只响一次。
     整帧 115KB 走一遍要 0.3s+，而每轮变化通常只有 1~3 行——按行差量下发
     后拉帧从 ~0.3s 缩到 ~50ms，设备可以每轮都拉，字幕上屏节奏翻倍。
     full=True（设备拉帧失败后主动要求）忽略差量基线，整屏重发，防止设备
@@ -474,6 +507,10 @@ def frame_diff(device_id: str, full: bool = False) -> bytes:
     frame = current_frame(device_id)
     with _lock:
         session = _sessions.get(device_id)
+        beep_flag = 0
+        if session is not None and session.get("beep_pending"):
+            beep_flag = 1
+            session["beep_pending"] = False  # 取走即清：一句只滴一声
         last = None if full else (session.get("last_frame") if session else None)
         if session is not None:
             session["last_frame"] = frame
@@ -486,8 +523,8 @@ def frame_diff(device_id: str, full: bool = False) -> bytes:
             rows.extend(chunk)
             count += 1
     if last is not None and count == 0:
-        return b"\x00\x00"  # 无变化：设备什么都不画
-    return bytes([count & 0xFF]) + bytes(rows)
+        return bytes([beep_flag, 0])  # 无变化：设备只处理滴声标志
+    return bytes([beep_flag, count & 0xFF]) + bytes(rows)
 
 
 def session_note(device_id: str) -> str:
