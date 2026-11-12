@@ -79,6 +79,52 @@ def wrap_text(text: str) -> List[str]:
     return segments
 
 
+def render_rows(
+    row_texts: List[Optional[str]],
+    highlight_row: Optional[int] = None,
+    note: Optional[str] = None,
+) -> bytes:
+    """固定行槽渲染：16 个行槽各自的文本 → 240x240 RGB565 大端字节串。
+
+    row_texts[r] 为 None 表示该行空。行位由调用方维护（每句钉在固定行，
+    精转原地改写，不做全局重排）——这是「说满回卷、句子不搬家」的关键。
+    highlight_row 高亮最新内容所在行。
+    """
+    image = Image.new("RGB", (FRAME_WIDTH, FRAME_HEIGHT), _BG)
+    draw = ImageDraw.Draw(image)
+    font = _get_font(_FONT_SIZE)
+
+    newest_row = -1
+    if row_texts:
+        occupied = [r for r, t in enumerate(row_texts) if t]
+        if occupied:
+            newest_row = highlight_row if highlight_row in occupied else occupied[-1]
+    for row, text in enumerate(row_texts or []):
+        if not text:
+            continue
+        color = _TEXT_BRIGHT if row == newest_row else _TEXT_DIM
+        draw.text(
+            (0, row * _LINE_HEIGHT + _BASELINE_OFFSET),
+            text,
+            font=font,
+            fill=color,
+            anchor="ls",
+        )
+    if newest_row < 0 and note:
+        draw.text((0, _BASELINE_OFFSET), note, font=font, fill=_NOTE_COLOR, anchor="ls")
+
+    # RGB888 → RGB565 大端
+    raw = image.convert("RGB").tobytes()
+    out = bytearray(FRAME_BYTES)
+    for index in range(FRAME_WIDTH * FRAME_HEIGHT):
+        r = raw[index * 3]
+        g = raw[index * 3 + 1]
+        b = raw[index * 3 + 2]
+        value = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3)
+        struct.pack_into(">H", out, index * 2, value)
+    return bytes(out)
+
+
 def render_live_frame(
     segments: List[Tuple[int, str]], note: Optional[str] = None
 ) -> bytes:

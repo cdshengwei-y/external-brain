@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from agent_gateway import live_screen
-from agent_gateway.live_screen import render_live_frame, wrap_text
+from agent_gateway.live_screen import render_rows, wrap_text
 
 _MODEL_DIR = Path.home() / ".cache/sherpa-asr/sherpa-onnx-streaming-zipformer-zh-14M-2023-02-23"
 _MAX_UTTERANCE_SECONDS = 20.0  # 单句音频上限：超长强制定稿，防止内存无限涨
@@ -81,7 +81,12 @@ def _new_stream(device_id: str) -> None:
         device_id,
         {
             "stream": None,
-            "utterances": [],  # 定稿行（千问精转后原地替换）
+            "utterances": [],  # 每句粗字文本（千问/SenseVoice 精转后原地替换）
+            "slots": [],       # 与 utterances 对齐：{"start": 起始行, "count": 行数}
+            # 固定行槽（2026-11-12）：16 行各自钉住内容，句子定稿/精转只原地
+            # 改写自己的行，不做全局重排——修「每说完一句屏幕就清空重排」。
+            "rows": [None] * 16,
+            "next_row": 0,
             "partial": "",
             "utterance_pcm": bytearray(),
             "last_active": time.time(),
@@ -89,6 +94,14 @@ def _new_stream(device_id: str) -> None:
     )
     recognizer = _get_recognizer()
     session["stream"] = recognizer.create_stream()
+
+
+def _write_rows(session: dict, start_row: int, pieces: List[str]) -> int:
+    """把折行段写进行槽（回卷覆盖旧行），返回占用的行数。"""
+    rows: List[Optional[str]] = session["rows"]
+    for offset, piece in enumerate(pieces):
+        rows[(start_row + offset) % 16] = piece
+    return len(pieces)
 
 
 def reset_session(device_id: str) -> None:
@@ -174,12 +187,22 @@ def _finalize_utterance(
     _dump_utterance_pcm(pcm)
 
     if _contains_clear(partial):
-        session["utterances"] = []  # 清屏重新开始
+        # 清屏重新开始：行槽、行位计数、句列表全部归零
+        session["utterances"] = []
+        session["slots"] = []
+        session["rows"] = [None] * 16
+        session["next_row"] = 0
         return
 
     utterance_index = len(session["utterances"])
     if partial:
         session["utterances"].append(partial)
+        # 行槽写入：这句钉在 next_row 起的固定行位上（回卷覆盖最旧的行）
+        pieces = wrap_text(partial)
+        start_row = session["next_row"]
+        count = _write_rows(session, start_row, pieces)
+        session["slots"].append({"start": start_row, "count": count})
+        session["next_row"] = (start_row + count) % 16
 
     # 尾部 1.2s 重喂（见上注释）：救回卡在重置窗口里的下一句开头
     tail = pcm[-int(_PCM_RATE * 1.2) * 2:]
@@ -216,6 +239,7 @@ def _finalize_utterance(
                 and _looks_like_refinement(partial, sense_text)
             ):
                 session["utterances"][utterance_index] = sense_text
+                _rewrite_rows(session, utterance_index, sense_text)
                 refined = sense_text
                 print(
                     f"[{time.strftime('%H:%M:%S')}] [LIVE] SenseVoice 精转 "
@@ -263,6 +287,21 @@ def _dump_utterance_pcm(pcm: bytes) -> None:
             old.unlink(missing_ok=True)
     except OSError:
         pass  # 诊断落盘失败不影响主链路
+
+
+def _rewrite_rows(session: dict, index: int, new_text: str) -> None:
+    """精转后原地改写某句占用的行槽（行位不变，不做全局重排）。
+
+    新文本行数变少时多余行清空；变多时向后覆盖（牺牲的是更旧的行）。
+    """
+    slots = session["slots"]
+    if index >= len(slots):
+        return
+    slot = slots[index]
+    rows: List[Optional[str]] = session["rows"]
+    for offset in range(slot["count"]):
+        rows[(slot["start"] + offset) % 16] = None
+    slot["count"] = _write_rows(session, slot["start"], wrap_text(new_text))
 
 
 def _finalize_with_qwen(
@@ -314,6 +353,7 @@ def _finalize_with_qwen(
                 return
             if session["utterances"][utterance_index] == rough_text:
                 session["utterances"][utterance_index] = text
+                _rewrite_rows(session, utterance_index, text)
                 print(
                     f"[{time.strftime('%H:%M:%S')}] [LIVE] 千问精转 #{utterance_index}: "
                     f"{rough_text!r} -> {text!r}",
@@ -335,27 +375,32 @@ def _looks_like_refinement(rough: str, refined: str) -> bool:
 
 
 def current_frame(device_id: str) -> bytes:
-    """当前整屏帧：定稿行 + 正在说的 partial（最新段高亮）。"""
+    """当前整屏帧：16 个固定行槽 + 正在说的 partial（追加在下一空行）。"""
     with _lock:
         session = _sessions.get(device_id)
         if session is None:
-            return render_live_frame([], note="说话吧…")
+            return render_rows([None] * 16, note="说话吧…")
         session["last_active"] = time.time()
-        utterances: List[str] = list(session["utterances"])
+        rows: List[Optional[str]] = list(session["rows"])
+        next_row: int = session["next_row"]
         partial: str = session.get("partial") or ""
 
-    # 定稿行 + 当前行（partial），统一折行成显示段
-    lines = [text for text in utterances if text]
+    highlight = None
     if partial:
-        lines.append(partial)
-    segments: List[Tuple[int, str]] = []
-    for line in lines:
-        for piece in wrap_text(line):
-            segments.append((len(segments), piece))
+        # 正在说的话写到下一空行起（只影响渲染，不动行槽；定稿时才落槽）
+        pieces = wrap_text(partial)
+        for offset, piece in enumerate(pieces):
+            row = (next_row + offset) % 16
+            rows[row] = piece
+            highlight = row
+    else:
+        occupied = [r for r, text in enumerate(rows) if text]
+        if occupied:
+            highlight = occupied[-1]
 
-    if segments:
-        return render_live_frame(segments)
-    return render_live_frame([], note="说话吧…")
+    if any(text for text in rows):
+        return render_rows(rows, highlight_row=highlight)
+    return render_rows([None] * 16, note="说话吧…")
 
 
 _ROW_HEIGHT = live_screen._LINE_HEIGHT  # 15px
