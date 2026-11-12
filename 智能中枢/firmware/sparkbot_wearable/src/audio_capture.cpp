@@ -2004,8 +2004,10 @@ void upload_wav_to_hub(const char* session_mode = "conversation") {
 // 表情撤掉，屏幕全程字幕。不进意图管线、不回语音。
 
 constexpr size_t kLiveFrameBytes = 240UL * 240UL * 2UL;
-constexpr size_t kStreamChunkFrames = 9600;  // 600ms @ 16k
-uint8_t* live_frame_buffer = nullptr;        // PSRAM，115KB
+constexpr size_t kStreamChunkFrames = 8000;  // 500ms @ 16k（上屏节奏 ~0.7s）
+// 差量帧最大 = 1 + 16×(1+7200) = 115218B，留足余量
+constexpr size_t kLiveDiffMaxBytes = kLiveFrameBytes + 64;
+uint8_t* live_frame_buffer = nullptr;        // PSRAM
 
 bool live_stream_reset() {
   WiFiClient client;
@@ -2101,12 +2103,12 @@ bool live_fetch_stream_frame() {
     return false;
   }
   const int len = http.getSize();
-  if (len != static_cast<int>(kLiveFrameBytes)) {
+  if (len <= 0 || len > static_cast<int>(kLiveDiffMaxBytes)) {
     http.end();
     return false;
   }
   if (live_frame_buffer == nullptr) {
-    live_frame_buffer = static_cast<uint8_t*>(ps_malloc(kLiveFrameBytes));
+    live_frame_buffer = static_cast<uint8_t*>(ps_malloc(kLiveDiffMaxBytes));
     if (live_frame_buffer == nullptr) {
       Serial.println("[LIVE] frame buffer alloc failed");
       http.end();
@@ -2115,21 +2117,31 @@ bool live_fetch_stream_frame() {
   }
   WiFiClient* stream = http.getStreamPtr();
   size_t received = 0;
-  while (received < kLiveFrameBytes) {
+  while (received < static_cast<size_t>(len)) {
     const int got =
-        stream->read(live_frame_buffer + received, kLiveFrameBytes - received);
+        stream->read(live_frame_buffer + received, len - received);
     if (got < 0) {
       break;
     }
     received += static_cast<size_t>(got);
   }
   http.end();
-  if (received != kLiveFrameBytes) {
+  if (received != static_cast<size_t>(len)) {
     return false;
   }
-  // 大端 RGB565：uint8 强转 uint16 后 pushImage 的字节交换正好补回 LCD 要的序
-  screen_bus::tft().pushImage(
-      0, 0, 240, 240, reinterpret_cast<uint16_t*>(live_frame_buffer));
+  // 差量格式：[行数 1B] + N×[行号 1B + 7200B 行数据（大端 RGB565）]
+  // 行号 0..15 对应屏幕 y = 行号×15px；只贴变化的行，全帧 115KB 的时代过去了
+  const uint8_t count = live_frame_buffer[0];
+  size_t offset = 1;
+  for (uint8_t index = 0; index < count && offset + 1 + 7200UL <= received;
+       ++index) {
+    const uint8_t row = live_frame_buffer[offset];
+    offset += 1;
+    screen_bus::tft().pushImage(
+        0, row * 15, 240, 15,
+        reinterpret_cast<uint16_t*>(live_frame_buffer + offset));
+    offset += 7200;
+  }
   return true;
 }
 
@@ -2146,7 +2158,6 @@ bool run_live_transcription() {
   if (!live_stream_reset()) {
     Serial.println("[LIVE] hub unreachable; will retry on stream");
   }
-  int frame_tick = 0;
   while (true) {
     if (Serial.available() > 0) {
       Serial.println("[LIVE] interrupted by serial input");
@@ -2163,10 +2174,8 @@ bool run_live_transcription() {
       delay(1000);
       continue;
     }
-    // ③ 隔轮拉一次字幕帧（115KB 全帧 ≈ 0.3s，隔轮摊薄，留足 ring 余量）
-    if (++frame_tick % 2 == 0) {
-      live_fetch_stream_frame();
-    }
+    // ③ 每轮都拉字幕帧（差量下发只有几 KB，~50ms）——上屏节奏 ~0.7s
+    live_fetch_stream_frame();
   }
 }
 
