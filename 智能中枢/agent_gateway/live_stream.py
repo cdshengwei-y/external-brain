@@ -218,13 +218,35 @@ def feed_pcm(device_id: str, pcm_bytes: bytes) -> None:
 
 
 def _wake_hit(text: str) -> bool:
-    """流式 partial 里是否出现唤醒词（复用中枢的模糊匹配表与错听变体）。"""
+    """流式 partial 里是否出现唤醒词。
+
+    两层匹配：
+    1. 完整词：复用中枢的模糊匹配表（贾维斯/查维斯/假威斯…全变体）；
+    2. 碎片匹配（2026-11-12）：流式解码常把名字拆成两字碎片——实测
+       「叫维」「家为师」「假为师」都是「贾维斯」的半截。姓字×名字字
+       的二元组（贾/家/假/加/叫…×维/威/伟/为）与 名字字×尾字
+       （维/威/伟×斯/师）都算命中。「拉斯维加斯」这类不匹配（顺序反）。
+    """
+    text = str(text or "")
     try:
         from agent_gateway.portable import PortableRequestService
 
-        return PortableRequestService._is_wake_phrase(text)
-    except Exception:  # noqa: BLE001 - 匹配器不可用时退回精确匹配
-        return "贾维斯" in str(text or "")
+        if PortableRequestService._is_wake_phrase(text):
+            return True
+    except Exception:  # noqa: BLE001
+        if "贾维斯" in text:
+            return True
+    heads = "贾加家假嘉叫佳甲驾价"
+    mids = "维威伟为"
+    for head in heads:
+        for mid in mids:
+            if head + mid in text:
+                return True
+    for mid in "维威伟":
+        for tail in "斯师士":
+            if mid + tail in text:
+                return True
+    return False
 
 
 def _finalize_utterance(
@@ -280,9 +302,19 @@ def _finalize_utterance(
     utterance_index = len(session["utterances"])
     if partial:
         session["utterances"].append(partial)
-        # 行槽写入：这句钉在 next_row 起的固定行位上（回卷覆盖最旧的行）
+        # 行槽写入：这句钉在 next_row 起的固定行位上。
+        # 说满一整页自动清屏（2026-11-12 用户要求）：句子写到底部还放不下
+        # 时，清空整页从第 0 行重开——不再挤成一团乱麻。
         pieces = wrap_text(partial)
         start_row = session["next_row"]
+        if start_row + len(pieces) > 16:
+            session["rows"] = [None] * 16
+            session["slots"] = []
+            session["utterances"] = []
+            session["next_row"] = 0
+            utterance_index = 0
+            start_row = 0
+            print(f"[{time.strftime('%H:%M:%S')}] [LIVE] 屏幕已满，自动清屏重开", flush=True)
         count = _write_rows(session, start_row, pieces)
         session["slots"].append({"start": start_row, "count": count})
         session["next_row"] = (start_row + count) % 16
@@ -331,6 +363,27 @@ def _finalize_utterance(
                 )
     except Exception as error:  # noqa: BLE001 - 精转失败保留粗字
         print(f"[LIVE] SenseVoice 精转失败：{error}", flush=True)
+
+    # 定稿命中补判（2026-11-12）：流式 partial 常把「贾维斯」拆成碎片漏检，
+    # SenseVoice 精转是全句最准的转写——这里用完整词匹配再判一次（不用碎片
+    # 匹配：精转文本里偶发的「甲为」类碎片会误报）。
+    # 3s 冷却与 partial 命中的那次滴声互斥，不会双响。
+    now_ts = time.time()
+    if refined and now_ts - session.get("last_beep_ts", 0) >= 3.0:
+        try:
+            from agent_gateway.portable import PortableRequestService
+
+            hit = PortableRequestService._is_wake_phrase(refined)
+        except Exception:  # noqa: BLE001
+            hit = "贾维斯" in refined
+        if hit:
+            session["beep_pending"] = True
+            session["beep_armed"] = False
+            session["last_beep_ts"] = now_ts
+            print(
+                f"[{time.strftime('%H:%M:%S')}] [LIVE] 定稿命中唤醒词（设备将滴声）: {refined!r}",
+                flush=True,
+            )
 
     # 第二精转：千问（后台线程，网络调用；成功且像修正时再替换一次）
     _get_finalize_pool().submit(
