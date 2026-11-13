@@ -294,7 +294,6 @@ def _finalize_utterance(
         recognizer.reset(session["stream"])
     session["partial"] = ""
     session["utterance_pcm"] = bytearray()
-    session["beep_armed"] = True  # 句边界：重新武装滴声探针
 
     # 远场噪声防线：整句能量低于 -33dBFS = 房间远处的说话/电视。增益放大
     # 后这种音频被流式引擎大量幻听（用户实测连不成句 + 乱码行），不上屏、
@@ -362,6 +361,13 @@ def _finalize_utterance(
             recognizer.decode_stream(stream)
         session["partial"] = str(recognizer.get_result(stream) or "").strip()
         session["utterance_pcm"] = bytearray(tail)
+
+    # 滴声探针的武装时机（2026-11-13）：重喂产物属于上一句的尾巴——实测
+    # 会把上一句尾巴解码成「他们一次他们为师」这类垃圾并命中匹配器，若此
+    # 处照常武装，下一块喂入时垃圾 partial 再命中 = 一句喊声滴两下。所以
+    # 只有重喂产物不命中时才武装；无重喂（短句）直接武装。
+    if not tail or not _wake_hit(session.get("partial") or ""):
+        session["beep_armed"] = True
 
     # 音频太短（<0.4s）多半是噪声碎片，不值得花一次精转
     if len(pcm) < _PCM_RATE * 2 * 0.4 or not pcm:
