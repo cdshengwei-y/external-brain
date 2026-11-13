@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import queue
+import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 from typing import Any, Dict, Optional
@@ -647,6 +648,38 @@ class HubHttpServer(ThreadingHTTPServer):
         self.portable_service = portable_service or PortableRequestService(service)
 
 
+def _run_udp_discovery_responder(port: int = 18788) -> None:
+    """桌宠设备的 UDP 广播发现应答（2026-11-13）。
+
+    设备广播 PETHUB_DISCOVER 到子网广播地址:18788，这里应答 PETHUB_HERE——
+    设备从应答包的源地址拿到中枢当前 IP。Mac 的 DHCP 地址三天漂了三次
+    （.49→.57→.15），设备固件写死 IP 每次都得重烧；广播发现一劳永逸。
+    """
+    import socket
+
+    def _loop() -> None:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.bind(("", port))
+        except OSError as error:
+            print(f"[UDP] 发现应答端口 {port} 绑定失败: {error}")
+            return
+        print(f"[UDP] 中枢发现应答已启动（端口 {port}）")
+        while True:
+            try:
+                data, addr = sock.recvfrom(256)
+                if data.startswith(b"PETHUB_DISCOVER"):
+                    sock.sendto(b"PETHUB_HERE", addr)
+            except OSError:
+                continue
+
+    thread = threading.Thread(
+        target=_loop, daemon=True, name="hub-udp-discovery"
+    )
+    thread.start()
+
+
 def serve(
     service: HubService,
     host: str = "127.0.0.1",
@@ -656,6 +689,7 @@ def serve(
     owns_portable_service = portable_service is None
     server = HubHttpServer((host, port), service, portable_service)
     print(f"智能中枢 API 已启动: http://{host}:{port}")
+    _run_udp_discovery_responder()
     try:
         server.serve_forever()
     except KeyboardInterrupt:

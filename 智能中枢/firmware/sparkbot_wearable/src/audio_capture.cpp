@@ -4,6 +4,7 @@
 #include <ArduinoJson.h>
 #include <HTTPClient.h>
 #include <WiFi.h>
+#include <WiFiUdp.h>
 #include <Wire.h>
 #include <driver/i2s.h>
 #include <esp32-hal-psram.h>
@@ -41,6 +42,10 @@
 #ifndef SPARKBOT_DEVICE_ID
 #define SPARKBOT_DEVICE_ID "sparkbot_wearable_001"
 #endif
+
+// 中枢地址运行时变量：UDP 广播发现后由 discover_hub_via_udp() 改写，
+// fallback 在 wifi_config.h（Mac DHCP 三天漂了三次，写死必聋）
+String g_hub_base_url = SPARKBOT_HUB_FALLBACK_URL;
 
 namespace {
 
@@ -1366,7 +1371,7 @@ bool connect_wifi_for_upload() {
 }
 
 bool post_audio_to_hub(String& media_id) {
-  if (strlen(SPARKBOT_HUB_BASE_URL) == 0) {
+  if (g_hub_base_url.length() == 0) {
     Serial.println("[HUB] upload disabled: configure include/wifi_config.h first");
     return false;
   }
@@ -2044,6 +2049,46 @@ void upload_wav_to_hub(const char* session_mode = "conversation") {
   submit_captured_wav_to_hub(session_mode);
 }
 
+// UDP 广播发现中枢（2026-11-13）：Mac 的 DHCP 地址三天漂了三次
+// （.49→.57→.15），写死必聋。设备广播 PETHUB_DISCOVER 到子网
+// 255.255.255.255:18788，中枢应答 PETHUB_HERE——应答方地址就是中枢。
+bool discover_hub_via_udp() {
+  if (WiFi.status() != WL_CONNECTED) {
+    connect_wifi_for_upload();
+  }
+  if (WiFi.status() != WL_CONNECTED) {
+    return false;
+  }
+  static WiFiUDP udp;
+  udp.stop();
+  udp.begin(SPARKBOT_HUB_UDP_PORT + 1);
+  IPAddress broadcast = WiFi.localIP();
+  broadcast[3] = 255;
+  udp.beginPacket(broadcast, SPARKBOT_HUB_UDP_PORT);
+  udp.write(reinterpret_cast<const uint8_t*>("PETHUB_DISCOVER"), 15);
+  udp.endPacket();
+  const unsigned long deadline = millis() + 2000;
+  while (millis() < deadline) {
+    const int packet_size = udp.parsePacket();
+    if (packet_size > 0) {
+      char buffer[32] = {0};
+      const int read_len = udp.read(buffer, sizeof(buffer) - 1);
+      if (read_len >= 11 && strncmp(buffer, "PETHUB_HERE", 11) == 0) {
+        g_hub_base_url =
+            "http://" + udp.remoteIP().toString() + ":18787";
+        Serial.printf("[WIFI] hub discovered via UDP: %s\n",
+                      g_hub_base_url.c_str());
+        udp.stop();
+        return true;
+      }
+    }
+    delay(10);
+  }
+  udp.stop();
+  Serial.println("[WIFI] UDP discovery failed; keep fallback address");
+  return false;
+}
+
 // ---------------- 实时字幕流式模式（2026-11-12 三版） ----------------
 // 真·流式：设备每 600ms 把 PCM 原样推给中枢（不建 wav、不等静音、不轮询
 // request），中枢用流式 zipformer 增量解码出 partial 文字实时上屏；停顿
@@ -2231,9 +2276,10 @@ bool run_live_transcription() {
   screen_bus::set_backlight(true);
   screen_bus::tft().fillScreen(0x0841);  // 与中枢帧背景同色（8,14,32）
   Serial.println("[LIVE] streaming subtitle mode; say 退下/清屏 to clear");
-  if (!live_stream_reset()) {
-    Serial.println("[LIVE] hub unreachable; will retry on stream");
-  }
+  // WiFi + UDP 广播发现中枢（Mac IP 漂移免疫：连不上时每轮自动重新发现）
+  connect_wifi_for_upload();
+  discover_hub_via_udp();
+  live_stream_reset();
   while (true) {
     if (Serial.available() > 0) {
       Serial.println("[LIVE] interrupted by serial input");
@@ -2247,7 +2293,8 @@ bool run_live_transcription() {
     // ② 推给中枢流式解码（响应很快，不做整段识别）
     const unsigned long http_started = millis();
     if (!live_stream_post(wav_mono_buffer, kStreamChunkFrames)) {
-      Serial.println("[LIVE] hub unreachable; retry in 300ms");
+      Serial.println("[LIVE] hub unreachable; UDP re-discovery");
+      discover_hub_via_udp();
       delay(300);
       continue;
     }
