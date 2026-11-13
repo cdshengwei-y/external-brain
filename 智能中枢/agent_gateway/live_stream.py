@@ -188,6 +188,16 @@ def feed_pcm(device_id: str, pcm_bytes: bytes) -> None:
         while recognizer.is_ready(stream):
             recognizer.decode_stream(stream)
         partial = str(recognizer.get_result(stream) or "").strip()
+        # 诊断日志（2026-11-13）：只在识别文本变化时打——hub 识别器曾出现
+        # 「进程活着但 partial 恒空」的卡死态，重启才愈。这条日志用于下次
+        # 快速定位是「没收到音频」还是「收到但没解码」。
+        if partial != session.get("_prev_partial"):
+            session["_prev_partial"] = partial
+            print(
+                f"[{time.strftime('%H:%M:%S')}] [LIVE] decode dev={device_id} "
+                f"rms={raw_rms_db:.1f} partial={partial!r}",
+                flush=True,
+            )
         session["partial"] = partial
 
         # 唤醒词命中探针（2026-11-12）：流式识别一命中「贾维斯」（含模糊
