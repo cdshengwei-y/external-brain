@@ -2100,6 +2100,9 @@ constexpr size_t kStreamChunkFrames = 8000;  // 500ms @ 16k（上屏节奏 ~0.7s
 // 差量帧最大 = 1 + 16×(1+7200) = 115218B，留足余量
 constexpr size_t kLiveDiffMaxBytes = kLiveFrameBytes + 64;
 uint8_t* live_frame_buffer = nullptr;        // PSRAM
+// 每次拉帧带回的标志位（live_fetch_stream_frame 写入，主循环消费）：
+// bit0 = 唤醒命中滴一声；bit1 = 近场唤醒命中 → 切入对话模式
+uint8_t g_live_frame_flags = 0;
 
 bool live_stream_reset() {
   WiFiClient client;
@@ -2246,9 +2249,11 @@ bool live_fetch_stream_frame() {
   }
   need_full = false;  // 本次成功，差量基线重新同步
   // 差量格式：[flags 1B][行数 1B] + N×[行号 1B + 7200B 行数据（大端 RGB565）]
-  // flags bit0 = 唤醒词命中（中枢流式识别到贾维斯）→ 滴一声 0.5s
+  // flags bit0 = 唤醒词命中（安静/远场）→ 滴一声 0.5s
+  // flags bit1 = 近场唤醒命中 → 切入对话模式（主循环消费）
   // 行号 0..15 对应屏幕 y = 行号×15px；只贴变化的行，全帧 115KB 的时代过去了
   const uint8_t flags = live_frame_buffer[0];
+  g_live_frame_flags = flags;
   const uint8_t count = live_frame_buffer[1];
   size_t offset = 2;
   for (uint8_t index = 0; index < count && offset + 1 + 7200UL <= received;
@@ -2303,6 +2308,14 @@ bool run_live_transcription() {
     // 每轮 HTTP 总耗时 = 空档期音频量；超过 ~1s（ring 容量）就会丢词，
     // 这条日志是丢词诊断的第一证据。
     Serial.printf("[LIVE] http=%lums\n", millis() - http_started);
+    // ④ 近场唤醒命中：播「我在！」提示音并请求切入对话模式
+    if (g_live_frame_flags & 0x02) {
+      g_live_frame_flags = 0;
+      Serial.println("[LIVE] wake accepted (near-field); switching to conversation");
+      play_wakeup_audio();
+      return true;  // run_voice_conversation 收到后进 converse_with_face
+    }
+    g_live_frame_flags = 0;
   }
 }
 
@@ -2417,11 +2430,21 @@ bool wait_for_wake_word() {
 }
 
 void run_voice_conversation() {
-  // 实时字幕模式（2026-11-11 二版）：免唤醒词、屏幕常亮，上电即开始转写。
-  // 原来的「静默待机 ⇄ 唤醒 ⇄ 对话」状态机整体停用，字幕屏永不离开。
-  Serial.println("[VOICE] live subtitle mode: always on, no wake word");
-  if (!run_live_transcription()) {
-    Serial.println("[VOICE] manual mode; send v to resume live mode");
+  // 字幕模式 ⇄ 对话模式双态循环（2026-11-19）：
+  // 平时常驻字幕（免唤醒、转写上屏）；近场喊「贾维斯」→ 播「我在！」→
+  // 切对话模式（说话即指令、语音回答）；对话结束/45s 空闲 → 回字幕模式。
+  Serial.println("[VOICE] subtitle mode always-on; say 贾维斯 to talk");
+  while (true) {
+    const bool wake_requested = run_live_transcription();
+    if (!wake_requested) {
+      // 串口打断：保留原「手动模式」语义，退出自动循环
+      Serial.println("[VOICE] manual mode; send v to resume live mode");
+      return;
+    }
+    Serial.println("[VOICE] entering conversation mode");
+    converse_with_face();  // 阻塞：说话即指令、语音回答；45s 空闲/退下吧 返回
+    Serial.println("[VOICE] conversation ended; back to subtitles");
+    // 回字幕模式（run_live_transcription 会重置屏幕与中枢会话）
   }
 }
 

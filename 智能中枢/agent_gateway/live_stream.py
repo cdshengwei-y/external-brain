@@ -99,6 +99,7 @@ def _new_stream(device_id: str) -> None:
             "last_active": time.time(),
             "beep_pending": False,  # 唤醒词命中 → 设备滴一声
             "beep_armed": True,     # 每句只响一次，endpoint 重新武装
+            "wake_switch": False,   # 近场唤醒命中 → 设备切入对话模式（flags bit1）
         },
     )
     recognizer = _get_recognizer()
@@ -181,6 +182,14 @@ def feed_pcm(device_id: str, pcm_bytes: bytes) -> None:
         raw_rms_db = 20 * math.log10(raw_rms / 32768) if raw_rms > 0 else -99.0
         if raw_rms_db >= _SPEAK_RMS_DBFS:
             session["last_speech_ts"] = time.time()
+        # 近 2 秒电平历史（分级唤醒用）：唤醒命中时 partial 已滞后到静音块，
+        # 单块电平是 -99 没有意义，要看说话那几块的峰值
+        now_mono = time.time()
+        history = session.setdefault("rms_history", [])
+        history.append((now_mono, raw_rms_db))
+        session["rms_history"] = [
+            (ts, db) for ts, db in history if now_mono - ts <= 2.0
+        ]
         samples = _normalize_samples(list(raw))
         stream = session["stream"]
         # 必须归一到 [-1, 1] 浮点：整型直喂振幅超万倍，识别直接乱码
@@ -204,6 +213,9 @@ def feed_pcm(device_id: str, pcm_bytes: bytes) -> None:
         # 变体）就让设备滴一声 0.5s——用户用「说 N 次数 N 声」测识别率。
         # 每句只响一次（endpoint 定稿后重新武装）+ 3 秒冷却：定稿后的尾部
         # 重喂会把上一句尾巴重新解码成唤醒词片段，没有冷却会连响两声。
+        # 2026-11-19 分级在 partial 阶段就做（定稿补判会被 3s 冷却挡住，
+        # wake_switch 永远轮不到）：近场响亮命中（当前块 rms ≥ -30）→ bit1
+        # 切对话；安静/远场命中 → bit0 仅滴声。电视声骗不进对话模式。
         now_ts = time.time()
         if (
             session.get("beep_armed")
@@ -211,13 +223,28 @@ def feed_pcm(device_id: str, pcm_bytes: bytes) -> None:
             and now_ts - session.get("last_beep_ts", 0) >= 3.0
             and _wake_hit(partial)
         ):
-            session["beep_pending"] = True
             session["beep_armed"] = False
             session["last_beep_ts"] = now_ts
-            print(
-                f"[{time.strftime('%H:%M:%S')}] [LIVE] 唤醒词命中（设备将滴声）: {partial!r}",
-                flush=True,
+            # 分级看近 2 秒峰值电平（partial 滞后，命中时当前块多为静音）。
+            # 阈值 -27：实测正常桌距说话 -17~-24、小声 -28~-37、电视 -30~-40，
+            # -27 把三者分开（2026-11-19 用户数据）。
+            recent_peak = max(
+                (db for _, db in session.get("rms_history", [])), default=-99.0
             )
+            if recent_peak >= -27.0:
+                session["wake_switch"] = True
+                print(
+                    f"[{time.strftime('%H:%M:%S')}] [LIVE] 近场唤醒命中（设备切入对话模式）"
+                    f" peak={recent_peak:.1f} partial={partial!r}",
+                    flush=True,
+                )
+            else:
+                session["beep_pending"] = True
+                print(
+                    f"[{time.strftime('%H:%M:%S')}] [LIVE] 唤醒词命中（安静/远场，仅滴声）"
+                    f" peak={recent_peak:.1f} partial={partial!r}",
+                    flush=True,
+                )
 
         # 单句音频累计（供千问精转）；超 20s 强制定稿防内存无限涨
         session["utterance_pcm"].extend(pcm_bytes)
@@ -401,16 +428,29 @@ def _finalize_utterance(
     # 定稿命中补判（2026-11-12）：流式 partial 常把「贾维斯」拆成碎片漏检，
     # SenseVoice 精转是全句最准的转写——这里用完整词匹配再判一次（不用碎片
     # 匹配：精转文本里偶发的「甲为」类碎片会误报）。
-    # 3s 冷却与 partial 命中的那次滴声互斥，不会双响。
+    # 2026-11-19 分级：近场响亮命中（rms ≥ -30）= 真在喊桌宠 → flags bit1
+    # 切入对话模式（设备播「我在」提示音）；安静/远场命中 → 只滴一声
+    # （bit0 探针），电视声永远骗不进对话模式。
     now_ts = time.time()
     if refined and now_ts - session.get("last_beep_ts", 0) >= 3.0:
         hit = _wake_hit(refined)
-        if hit:
+        if hit and rms_db >= -27.0:
+            session["wake_switch"] = True
+            session["beep_pending"] = False  # 播「我在」提示音，不再叠加滴声
+            session["beep_armed"] = False
+            session["last_beep_ts"] = now_ts
+            print(
+                f"[{time.strftime('%H:%M:%S')}] [LIVE] 近场唤醒命中（设备切入对话模式）"
+                f" rms={rms_db:.1f} text={refined!r}",
+                flush=True,
+            )
+        elif hit:
             session["beep_pending"] = True
             session["beep_armed"] = False
             session["last_beep_ts"] = now_ts
             print(
-                f"[{time.strftime('%H:%M:%S')}] [LIVE] 定稿命中唤醒词（设备将滴声）: {refined!r}",
+                f"[{time.strftime('%H:%M:%S')}] [LIVE] 定稿命中唤醒词（安静/远场，仅滴声）"
+                f" rms={rms_db:.1f} text={refined!r}",
                 flush=True,
             )
 
@@ -601,6 +641,10 @@ def frame_diff(device_id: str, full: bool = False) -> bytes:
         if session is not None and session.get("beep_pending"):
             beep_flag = 1
             session["beep_pending"] = False  # 取走即清：一句只滴一声
+        wake_flag = 0
+        if session is not None and session.get("wake_switch"):
+            wake_flag = 2  # bit1：设备切入对话模式
+            session["wake_switch"] = False  # 取走即清
         last = None if full else (session.get("last_frame") if session else None)
         if session is not None:
             session["last_frame"] = frame
@@ -613,8 +657,8 @@ def frame_diff(device_id: str, full: bool = False) -> bytes:
             rows.extend(chunk)
             count += 1
     if last is not None and count == 0:
-        return bytes([beep_flag, 0])  # 无变化：设备只处理滴声标志
-    return bytes([beep_flag, count & 0xFF]) + bytes(rows)
+        return bytes([beep_flag | wake_flag, 0])  # 无变化：设备只处理标志位
+    return bytes([beep_flag | wake_flag, count & 0xFF]) + bytes(rows)
 
 
 def session_note(device_id: str) -> str:
