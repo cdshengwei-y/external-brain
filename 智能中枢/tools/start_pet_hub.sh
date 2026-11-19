@@ -75,7 +75,11 @@ else
 fi
 echo
 
-exec python3 run.py \
+# python 解释器可覆盖（2026-11-13）：launchd/cron 的 PATH 极简，裸 `python3`
+# 会落到系统 python（没有 sherpa_onnx 直接起不来）。部署态（~/pethub）由
+# launchd plist 设 PET_HUB_PYTHON 指向实际解释器；开发态默认走 PATH。
+PYTHON_BIN="${PET_HUB_PYTHON:-python3}"
+exec "$PYTHON_BIN" run.py \
   --host "$HOST" \
   --port "$PORT" \
   "${MODE[@]}" \
