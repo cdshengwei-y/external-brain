@@ -72,6 +72,40 @@ def _get_recognizer():
     return _recognizer
 
 
+_KWS = None
+
+
+def _get_kws():
+    """关键词 spotting 模型（2026-11-19）：声学层面匹配「贾维斯」，天生容忍
+    发音不标准——文本匹配只认标准转写（必须发音很标准才触发，用户实测），
+    KWS 对「家危」「假意思」这类变形在声学打分层面就能中。模型 3.3M int8，
+    与流式识别共用同一路 PCM，CPU 开销可忽略。加载失败返回 None（退回
+    文本匹配）。"""
+    global _KWS
+    if _KWS is not None:
+        return _KWS
+    try:
+        import sherpa_onnx
+
+        model_dir = Path.home() / (
+            ".cache/sherpa-asr/sherpa-onnx-kws-zipformer-wenetspeech-3.3M-2024-01-01"
+        )
+        _KWS = sherpa_onnx.KeywordSpotter(
+            tokens=str(model_dir / "tokens.txt"),
+            encoder=str(model_dir / "encoder-epoch-12-avg-2-chunk-16-left-64.int8.onnx"),
+            decoder=str(model_dir / "decoder-epoch-12-avg-2-chunk-16-left-64.int8.onnx"),
+            joiner=str(model_dir / "joiner-epoch-12-avg-2-chunk-16-left-64.int8.onnx"),
+            keywords_file=str(model_dir / "keywords_wake_only.txt"),
+            num_threads=1,
+            sample_rate=_PCM_RATE,
+        )
+        print("[LIVE] 关键词 spotting 模型已加载（贾维斯声学匹配）", flush=True)
+    except Exception as error:  # noqa: BLE001 - KWS 挂了退回文本匹配
+        print(f"[LIVE] KWS 加载失败，退回文本匹配: {error}", flush=True)
+        _KWS = False  # False = 尝试过且失败，不再重复加载
+    return _KWS or None
+
+
 def _get_finalize_pool():
     global _finalize_pool
     if _finalize_pool is None:
@@ -104,6 +138,8 @@ def _new_stream(device_id: str) -> None:
     )
     recognizer = _get_recognizer()
     session["stream"] = recognizer.create_stream()
+    kws = _get_kws()
+    session["kws_stream"] = kws.create_stream() if kws else None
 
 
 def _write_rows(session: dict, start_row: int, pieces: List[str]) -> int:
@@ -193,7 +229,8 @@ def feed_pcm(device_id: str, pcm_bytes: bytes) -> None:
         samples = _normalize_samples(list(raw))
         stream = session["stream"]
         # 必须归一到 [-1, 1] 浮点：整型直喂振幅超万倍，识别直接乱码
-        stream.accept_waveform(_PCM_RATE, [s / 32768.0 for s in samples])
+        floats = [s / 32768.0 for s in samples]
+        stream.accept_waveform(_PCM_RATE, floats)
         while recognizer.is_ready(stream):
             recognizer.decode_stream(stream)
         partial = str(recognizer.get_result(stream) or "").strip()
@@ -209,6 +246,25 @@ def feed_pcm(device_id: str, pcm_bytes: bytes) -> None:
             )
         session["partial"] = partial
 
+        # 关键词 spotting（2026-11-19）：同一路 PCM 喂 KWS 模型做声学匹配，
+        # 容忍不标准发音（文本匹配只认标准转写）。标准用法：每 decode 一步
+        # 立即查 get_result——结果挂在解码瞬间，事后查恒为空（实测踩坑）；
+        # 检出后必须 reset_stream。命中走同一个 beep_pending 通道，文本匹配
+        # 保留作兜底（KWS 不可用时唯一路径）。
+        kws_hit = ""
+        kws = _get_kws()
+        if kws is not None:
+            ks = session.get("kws_stream")
+            if ks is None:
+                ks = session["kws_stream"] = kws.create_stream()
+            ks.accept_waveform(_PCM_RATE, floats)
+            while kws.is_ready(ks):
+                kws.decode_stream(ks)
+                r = str(kws.get_result(ks) or "").strip()
+                if r:
+                    kws.reset_stream(ks)
+                    kws_hit = r
+
         # 唤醒词命中探针（2026-11-12）：流式识别一命中「贾维斯」（含模糊
         # 变体）就让设备滴一声 0.5s——用户用「说 N 次数 N 声」测识别率。
         # 每句只响一次（endpoint 定稿后重新武装）+ 3 秒冷却：定稿后的尾部
@@ -216,11 +272,11 @@ def feed_pcm(device_id: str, pcm_bytes: bytes) -> None:
         # 2026-11-19 用户决定：暂不切对话模式，命中一律滴声（bit0）。
         # bit1 切换通道保留但休眠，以后要开随时恢复分级逻辑。
         now_ts = time.time()
+        text_hit = bool(partial) and _wake_hit(partial)
         if (
             session.get("beep_armed")
-            and partial
+            and (kws_hit or text_hit)
             and now_ts - session.get("last_beep_ts", 0) >= 3.0
-            and _wake_hit(partial)
         ):
             session["beep_armed"] = False
             session["last_beep_ts"] = now_ts
@@ -230,7 +286,7 @@ def feed_pcm(device_id: str, pcm_bytes: bytes) -> None:
             session["beeped_this_utterance"] = True
             print(
                 f"[{time.strftime('%H:%M:%S')}] [LIVE] 唤醒词命中（设备将滴声）"
-                f" partial={partial!r}",
+                f" kws={kws_hit!r} partial={partial!r}",
                 flush=True,
             )
 
