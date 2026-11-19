@@ -1032,16 +1032,52 @@ void play_test_tone() {
 // 流式识别一命中就回标志位，设备滴一声。说 N 次数 N 声即可测识别率。
 // 字幕模式的唤醒应答（2026-11-19 用户指定）：一声「在」，替代滴声与随机
 // 招呼语。片段由 tools/make_wake_clip.py 生成（wozai_audio.h），音色与中枢
-// 回复同源。face 挂起中不驱动嘴型。
+// 回复同源。结构完全照抄 play_wake_beep（唯一被证实可听见的播放路径），
+// 只是数据从合成正弦换成「在」的 PCM；play_pcm_clip 不能用——它内部已带
+// 收尾，外面任何 I2S 操作都会踩已卸载的驱动（LoadProhibited 实锤）。
 void play_zai_cue() {
-  if (!prepare_wakeup_playback()) {
+  stop_i2s();
+  codec_adc_ready = false;
+  if (!start_i2s(I2S_MODE_TX)) {
+    return;
+  }
+  if (!configure_codec_for_playback()) {
+    Serial.println("[LIVE] zai: ES8311 playback config failed");
+    stop_i2s();
     return;
   }
   digitalWrite(kPowerAmpEnablePin, HIGH);
   delay(20);
-  play_pcm_clip(
-      _tmp_sparkbot_wozai_20261106_pcm, _tmp_sparkbot_wozai_20261106_pcm_len,
-      false);
+
+  const int16_t* pcm_samples =
+      reinterpret_cast<const int16_t*>(_tmp_sparkbot_wozai_20261106_pcm);
+  const size_t total_samples = _tmp_sparkbot_wozai_20261106_pcm_len / 2;
+  constexpr size_t kChunkSamples = 256;
+  int16_t chunk_buffer[kChunkSamples];
+  size_t offset = 0;
+  while (offset < total_samples) {
+    const size_t samples = min(kChunkSamples, total_samples - offset);
+    for (size_t index = 0; index < samples; ++index) {
+      chunk_buffer[index] = pcm_samples[offset + index];
+    }
+    size_t bytes_written = 0;
+    const esp_err_t write_error = i2s_write(kI2sPort,
+                                            chunk_buffer,
+                                            samples * sizeof(int16_t),
+                                            &bytes_written,
+                                            pdMS_TO_TICKS(1000));
+    if (write_error != ESP_OK || bytes_written != samples * sizeof(int16_t)) {
+      Serial.printf("[LIVE] zai write failed: error=%s bytes=%u\n",
+                    esp_err_to_name(write_error),
+                    static_cast<unsigned>(bytes_written));
+      break;
+    }
+    offset += samples;
+  }
+  i2s_zero_dma_buffer(kI2sPort);
+  delay(30);
+  stop_i2s();  // 下轮 capture_pcm_block 会重装 RX 并重配 ADC
+  Serial.println("[LIVE] zai cue played");
 }
 
 void play_wake_beep() {
