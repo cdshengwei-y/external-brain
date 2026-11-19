@@ -314,8 +314,10 @@ def feed_pcm(device_id: str, pcm_bytes: bytes) -> None:
 
 # 同音字集（2026-11-12）：用户实测「贾维斯」被听成 价位/假卫诗/加微/家里斯/
 # 较为/贾维师 等——逐个硬编码追不完，改用三个同音字集 + 邻接规则覆盖。
-_JIA_CHARS = "贾家假加价甲架嘉佳驾稼叫较教交角"
-_WEI_CHARS = "维威伟为卫微位围唯委韦未味喂魏纬"
+# 2026-11-19 补：查（查尾）、危（家危）——实测漏网变体（KWS 阈值扫到 0.08
+# 也不中，音素结构差太远，只能文本层补）。
+_JIA_CHARS = "贾家假加价甲架嘉佳驾稼叫较教交角查茶差"
+_WEI_CHARS = "维威伟为卫微位围唯委韦未味喂魏纬危尾"
 # 与「维/威/伟」相邻的 sī/shī 字（为什么的「什」不在此列，防高频误触）
 _SI_ADJ_CHARS = "斯师诗士司丝私"
 # 「贾_ _斯」隔一字规则用的 sī/shī 字（距离=2，假释/加斯这类贴邻不触发）。
@@ -344,6 +346,11 @@ def _wake_hit(text: str) -> bool:
             and first in _JIA_CHARS
             and chars[i + 2] in _SI_FAR_CHARS
         ):
+            return True
+        # 专属变体规则（2026-11-19 用户实测漏网）：会/意 不能进 _WEI_CHARS
+        # ——会+师=「会师」、意+思=「意思」全是高频词，会爆炸误报。只对
+        # 贾系字相邻时才算（家会/假意思 这类实测变体）。
+        if first in _JIA_CHARS and second in "会意":
             return True
     return False
 
