@@ -1030,6 +1030,20 @@ void play_test_tone() {
 
 // 唤醒词命中提示音（2026-11-12）：0.5 秒 1kHz——用户说「贾维斯」，中枢
 // 流式识别一命中就回标志位，设备滴一声。说 N 次数 N 声即可测识别率。
+// 字幕模式的唤醒应答（2026-11-19 用户指定）：一声「在」，替代滴声与随机
+// 招呼语。片段由 tools/make_wake_clip.py 生成（wozai_audio.h），音色与中枢
+// 回复同源。face 挂起中不驱动嘴型。
+void play_zai_cue() {
+  if (!prepare_wakeup_playback()) {
+    return;
+  }
+  digitalWrite(kPowerAmpEnablePin, HIGH);
+  delay(20);
+  play_pcm_clip(
+      _tmp_sparkbot_wozai_20261106_pcm, _tmp_sparkbot_wozai_20261106_pcm_len,
+      false);
+}
+
 void play_wake_beep() {
   stop_i2s();
   codec_adc_ready = false;
@@ -2266,9 +2280,9 @@ bool live_fetch_stream_frame() {
     offset += 7200;
   }
   if (flags & 0x01) {
-    // 唤醒命中：播随机招呼语「我在/我在呢/来了来了」（2026-11-19 用户要求，
-    // 替代 0.5s 1kHz 滴声）。播完下轮采音自动恢复 RX。
-    play_wakeup_audio();
+    // 唤醒命中：一声「在」（2026-11-19 用户指定，替代滴声与随机招呼语）。
+    // 播完下轮采音自动恢复 RX。
+    play_zai_cue();
   }
   return true;
 }
