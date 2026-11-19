@@ -2266,7 +2266,9 @@ bool live_fetch_stream_frame() {
     offset += 7200;
   }
   if (flags & 0x01) {
-    play_wake_beep();  // 中枢识别到「贾维斯」：滴一声（说 N 次数 N 声测识别率）
+    // 唤醒命中：播随机招呼语「我在/我在呢/来了来了」（2026-11-19 用户要求，
+    // 替代 0.5s 1kHz 滴声）。播完下轮采音自动恢复 RX。
+    play_wakeup_audio();
   }
   return true;
 }
