@@ -225,6 +225,9 @@ def feed_pcm(device_id: str, pcm_bytes: bytes) -> None:
             session["beep_armed"] = False
             session["last_beep_ts"] = now_ts
             session["beep_pending"] = True
+            # 本句已滴过：定稿补判必须跳过，否则显示一遍滴一声、
+            # 补全再命中又滴一声（2026-11-19 用户实测一句两响）
+            session["beeped_this_utterance"] = True
             print(
                 f"[{time.strftime('%H:%M:%S')}] [LIVE] 唤醒词命中（设备将滴声）"
                 f" partial={partial!r}",
@@ -413,10 +416,13 @@ def _finalize_utterance(
     # 定稿命中补判（2026-11-12）：流式 partial 常把「贾维斯」拆成碎片漏检，
     # SenseVoice 精转是全句最准的转写——这里用完整词匹配再判一次（不用碎片
     # 匹配：精转文本里偶发的「甲为」类碎片会误报）。
-    # 3s 冷却与 partial 命中的那次滴声互斥，不会双响。
+    # 一句一响（2026-11-19 用户实测：显示命中滴一声、补全再命中又滴一声）：
+    # 本句 partial 阶段已滴过就跳过，标志在句边界（此处）复位。
     # 2026-11-19 用户决定暂不切对话模式：命中一律滴声（bit0）。
+    already_beeped = session.get("beeped_this_utterance", False)
+    session["beeped_this_utterance"] = False
     now_ts = time.time()
-    if refined and now_ts - session.get("last_beep_ts", 0) >= 3.0:
+    if refined and not already_beeped and now_ts - session.get("last_beep_ts", 0) >= 3.0:
         hit = _wake_hit(refined)
         if hit:
             session["beep_pending"] = True
