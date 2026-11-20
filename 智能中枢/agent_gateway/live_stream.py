@@ -284,6 +284,7 @@ def feed_pcm(device_id: str, pcm_bytes: bytes) -> None:
             # 本句已滴过：定稿补判必须跳过，否则显示一遍滴一声、
             # 补全再命中又滴一声（2026-11-19 用户实测一句两响）
             session["beeped_this_utterance"] = True
+            _broadcast_wake()  # UDP 即时推送：设备 ~0.3s 内播「在」
             print(
                 f"[{time.strftime('%H:%M:%S')}] [LIVE] 唤醒词命中（设备将滴声）"
                 f" kws={kws_hit!r} partial={partial!r}",
@@ -323,6 +324,20 @@ _SI_ADJ_CHARS = "斯师诗士司丝私"
 # 「贾_ _斯」隔一字规则用的 sī/shī 字（距离=2，假释/加斯这类贴邻不触发）。
 # 「司」不在此列：「上市公司」「开家公司」这类高频词会误触（11-13 实测）。
 _SI_FAR_CHARS = "斯师士诗使史市石"
+
+def _broadcast_wake() -> None:
+    """唤醒命中即时推送（2026-11-19）：UDP 广播到 18790，设备实时收包播
+    「在」——不等设备下一轮拉帧（最多省 ~0.7s 延迟）。失败静默。"""
+    try:
+        import socket
+
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        sock.sendto(b"SPARKBOT_WAKE", ("255.255.255.255", 18790))
+        sock.close()
+    except Exception:  # noqa: BLE001 - 推送失败不影响滴声标志兜底
+        pass
+
 
 def _wake_hit(text: str) -> bool:
     """流式 partial / 定稿文本里是否出现唤醒词「贾维斯」。

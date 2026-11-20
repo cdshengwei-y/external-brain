@@ -32,7 +32,8 @@ from agent_gateway.local_neural_tts import (  # noqa: E402
 
 HEADER_PATH = ROOT / "firmware/sparkbot_wearable/include/wozai_audio.h"
 SYMBOL = "_tmp_sparkbot_wozai_20261106_pcm"
-TARGET_RMS_DBFS = -20.4  # 与中枢回复音频一致（实测 reply rms）
+TARGET_RMS_DBFS = -13.0  # 2026-11-19：-20.4 在房间噪音里听不见（用户实测只听到
+                         # 切模式的咔声），抬到与蜂鸣振幅（-11.7dBFS）同级
 PEAK_CEILING = 0.7       # 峰值上限，和录音链路的归一化一致
 # 「我在」只有两个字，speed=1.0 合成出来约 0.54s，听感是「抢答」。
 # 0.78 拉到 0.7s 左右，接近人应声的节奏；再慢就会显得迟钝。

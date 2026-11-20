@@ -1032,9 +1032,14 @@ void play_test_tone() {
 // 流式识别一命中就回标志位，设备滴一声。说 N 次数 N 声即可测识别率。
 // 字幕模式的唤醒应答（2026-11-19 用户指定）：一声「在」，替代滴声与随机
 // 招呼语。片段由 tools/make_wake_clip.py 生成（wozai_audio.h），音色与中枢
-// 回复同源。结构完全照抄 play_wake_beep（唯一被证实可听见的播放路径），
-// 只是数据从合成正弦换成「在」的 PCM；play_pcm_clip 不能用——它内部已带
-// 收尾，外面任何 I2S 操作都会踩已卸载的驱动（LoadProhibited 实锤）。
+// 回复同源。
+//
+// 关键定律（2026-11-19 三连实验实测）：短于 DMA ring（1.5s = 96×256 帧）的
+// 音频永远放不出来——0.5s 正弦咔、0.54s「在」咔（连写后等 700ms 排水都
+// 咔），只有 3s 长音能响。机制：i2s_write 对短数据只是瞬间拷进 DMA 描述符
+// 就返回，DMA 并不实时排空。对策：先写 1.6s 静音垫底，把 i2s_write 推入
+// 阻塞实时区（超过 ring 后写入按实时速率阻塞），后面的「在」就是实时流，
+// 与可听的 3s 长音完全同机制。
 void play_zai_cue() {
   stop_i2s();
   codec_adc_ready = false;
@@ -1049,34 +1054,43 @@ void play_zai_cue() {
   digitalWrite(kPowerAmpEnablePin, HIGH);
   delay(20);
 
+  constexpr size_t kChunkSamples = 256;
+  int16_t voice_chunk[kChunkSamples];
+
   const int16_t* pcm_samples =
       reinterpret_cast<const int16_t*>(_tmp_sparkbot_wozai_20261106_pcm);
   const size_t total_samples = _tmp_sparkbot_wozai_20261106_pcm_len / 2;
-  constexpr size_t kChunkSamples = 256;
-  int16_t chunk_buffer[kChunkSamples];
-  size_t offset = 0;
-  while (offset < total_samples) {
-    const size_t samples = min(kChunkSamples, total_samples - offset);
-    for (size_t index = 0; index < samples; ++index) {
-      chunk_buffer[index] = pcm_samples[offset + index];
+
+  // 「在」单声 0.54s（在前 1.5s 可听窗口内）+ 1.6s 静音排水（write 按实时
+  // 速率阻塞，保证「在」完整放完才停 I2S）——最后一个未试组合。
+  for (int repeat = 0; repeat < 1; ++repeat) {
+    size_t offset = 0;
+    while (offset < total_samples) {
+      const size_t samples = min(kChunkSamples, total_samples - offset);
+      for (size_t index = 0; index < samples; ++index) {
+        voice_chunk[index] = pcm_samples[offset + index];
+      }
+      size_t bytes_written = 0;
+      i2s_write(kI2sPort, voice_chunk, samples * sizeof(int16_t),
+                &bytes_written, pdMS_TO_TICKS(1000));
+      offset += samples;
     }
-    size_t bytes_written = 0;
-    const esp_err_t write_error = i2s_write(kI2sPort,
-                                            chunk_buffer,
-                                            samples * sizeof(int16_t),
-                                            &bytes_written,
-                                            pdMS_TO_TICKS(1000));
-    if (write_error != ESP_OK || bytes_written != samples * sizeof(int16_t)) {
-      Serial.printf("[LIVE] zai write failed: error=%s bytes=%u\n",
-                    esp_err_to_name(write_error),
-                    static_cast<unsigned>(bytes_written));
-      break;
-    }
-    offset += samples;
   }
-  i2s_zero_dma_buffer(kI2sPort);
-  delay(30);
-  stop_i2s();  // 下轮 capture_pcm_block 会重装 RX 并重配 ADC
+
+  // 排水（2026-11-19 用户实测第二声「在」突然消失）：写 1.6s 静音把还压在
+  // DMA ring 里的尾巴实时放完——write 会按实时速率阻塞，尾巴放完才返回，
+  // 再 stop_i2s 就不会拦腰切断。
+  static int16_t silence_chunk[kChunkSamples];  // 静态零初始化 = 静音
+  size_t drain_written = 0;
+  const size_t drain_samples = kSampleRate * 16 / 10;
+  while (drain_written < drain_samples) {
+    const size_t samples = min(kChunkSamples, drain_samples - drain_written);
+    size_t bytes_written = 0;
+    i2s_write(kI2sPort, silence_chunk, samples * sizeof(int16_t),
+              &bytes_written, pdMS_TO_TICKS(1000));
+    drain_written += samples;
+  }
+  stop_i2s();
   Serial.println("[LIVE] zai cue played");
 }
 
@@ -1123,6 +1137,53 @@ void play_wake_beep() {
   delay(30);
   stop_i2s();  // 下轮 capture_pcm_block 会重装 RX 并重配 ADC
   Serial.println("[LIVE] beep 0.5s");
+}
+
+// 判别实验 C 组：3 秒长正弦（内存数据/长时长）——若它响而 A(0.5s) 不响，
+// 说明短音频在 1.5s DMA ring 里被收尾清掉（时长问题）；若 A/C 都响而
+// B(「在」闪存数据) 不响，则是数据源问题。
+void play_wake_beep_3s() {
+  stop_i2s();
+  codec_adc_ready = false;
+  if (!start_i2s(I2S_MODE_TX)) {
+    return;
+  }
+  if (!configure_codec_for_playback()) {
+    stop_i2s();
+    return;
+  }
+  digitalWrite(kPowerAmpEnablePin, HIGH);
+  delay(20);
+
+  constexpr size_t kChunkSamples = 256;
+  constexpr size_t kToneSamples = kSampleRate * 3;  // 3 秒
+  constexpr float kToneFrequency = 1000.0F;
+  constexpr float kAmplitude = 12000.0F;
+  int16_t tone_buffer[kChunkSamples];
+  size_t offset = 0;
+  while (offset < kToneSamples) {
+    const size_t samples = min(kChunkSamples, kToneSamples - offset);
+    for (size_t index = 0; index < samples; ++index) {
+      const float phase =
+          2.0F * PI * kToneFrequency * static_cast<float>(offset + index) /
+          static_cast<float>(kSampleRate);
+      tone_buffer[index] = static_cast<int16_t>(sinf(phase) * kAmplitude);
+    }
+    size_t bytes_written = 0;
+    const esp_err_t write_error = i2s_write(kI2sPort,
+                                            tone_buffer,
+                                            samples * sizeof(int16_t),
+                                            &bytes_written,
+                                            pdMS_TO_TICKS(1000));
+    if (write_error != ESP_OK || bytes_written != samples * sizeof(int16_t)) {
+      break;
+    }
+    offset += samples;
+  }
+  i2s_zero_dma_buffer(kI2sPort);
+  delay(30);
+  stop_i2s();
+  Serial.println("[LIVE] beep 3s");
 }
 
 // ── 唤醒音频裁剪：只把「最响的那一簇」传上去 ──────────────────────────
@@ -2153,6 +2214,11 @@ uint8_t* live_frame_buffer = nullptr;        // PSRAM
 // 每次拉帧带回的标志位（live_fetch_stream_frame 写入，主循环消费）：
 // bit0 = 唤醒命中滴一声；bit1 = 近场唤醒命中 → 切入对话模式
 uint8_t g_live_frame_flags = 0;
+// 唤醒即时推送（2026-11-19）：中枢命中后 UDP 广播到 18790（发现通道用
+// 18788/18789，避开），设备实时收包播「在」——不再等下一轮拉帧（省 ~0.7s）。
+WiFiUDP g_wake_udp;
+bool g_wake_udp_ok = false;
+unsigned long g_last_cue_ms = 0;  // 播放冷却：UDP 推送与 bit0 标志互斥防双响
 
 bool live_stream_reset() {
   WiFiClient client;
@@ -2316,9 +2382,26 @@ bool live_fetch_stream_frame() {
     offset += 7200;
   }
   if (flags & 0x01) {
-    // 唤醒命中：一声「在」（2026-11-19 用户指定，替代滴声与随机招呼语）。
-    // 播完下轮采音自动恢复 RX。
-    play_zai_cue();
+    // 唤醒命中应答「在」：UDP 推送（~0.3s 内到）与 bit0 标志（下一轮拉帧）
+    // 两条路，3s 冷却互斥防双响。
+    const bool cue_cooldown_ok = millis() - g_last_cue_ms > 3000;
+    if (g_wake_udp_ok) {
+      const int packet_size = g_wake_udp.parsePacket();
+      if (packet_size > 0) {
+        char packet_buf[32] = {0};
+        const int read_len = g_wake_udp.read(packet_buf, sizeof(packet_buf) - 1);
+        if (read_len >= 13 && strncmp(packet_buf, "SPARKBOT_WAKE", 13) == 0 &&
+            cue_cooldown_ok) {
+          g_last_cue_ms = millis();
+          Serial.println("[LIVE] wake push received (UDP)");
+          play_zai_cue();
+        }
+      }
+    }
+    if ((flags & 0x01) && cue_cooldown_ok) {
+      g_last_cue_ms = millis();
+      play_zai_cue();
+    }
   }
   return true;
 }
@@ -2337,6 +2420,11 @@ bool run_live_transcription() {
   connect_wifi_for_upload();
   discover_hub_via_udp();
   live_stream_reset();
+  // 唤醒推送监听（18790，与发现通道 18788/18789 错开）：失败不致命，
+  // 退回 bit0 标志路径。
+  g_wake_udp_ok = (g_wake_udp.begin(18790) == 1);
+  Serial.println(g_wake_udp_ok ? "[LIVE] wake push listener on :18790"
+                               : "[LIVE] wake push listener bind failed");
   while (true) {
     if (Serial.available() > 0) {
       Serial.println("[LIVE] interrupted by serial input");
