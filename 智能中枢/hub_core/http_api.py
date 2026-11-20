@@ -332,6 +332,13 @@ class HubRequestHandler(BaseHTTPRequestHandler):
                 device_id = parse_qs(parsed.query).get("device_id", [""])[0]
                 if not device_id:
                     raise ValidationError("device_id 必须是非空字符串")
+                # 记录设备 HTTP 来源 IP：唤醒命中后单播 UDP 推送用
+                # （公司 AP 拦广播，必须按 IP 单播才能送达）
+                try:
+                    live_stream.note_device_ip(
+                        device_id, self.client_address[0])
+                except Exception:  # noqa: BLE001 - 记录失败不影响推流
+                    pass
                 data = self._read_binary_body()
                 live_stream.feed_pcm(device_id, data)
                 self._send_json(200, {"ok": True})

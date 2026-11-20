@@ -134,6 +134,7 @@ def _new_stream(device_id: str) -> None:
             "beep_pending": False,  # 唤醒词命中 → 设备滴一声
             "beep_armed": True,     # 每句只响一次，endpoint 重新武装
             "wake_switch": False,   # 近场唤醒命中 → 设备切入对话模式（flags bit1）
+            "device_ip": None,      # 设备 HTTP 来源 IP（唤醒单播推送用）
         },
     )
     recognizer = _get_recognizer()
@@ -284,7 +285,7 @@ def feed_pcm(device_id: str, pcm_bytes: bytes) -> None:
             # 本句已滴过：定稿补判必须跳过，否则显示一遍滴一声、
             # 补全再命中又滴一声（2026-11-19 用户实测一句两响）
             session["beeped_this_utterance"] = True
-            _broadcast_wake()  # UDP 即时推送：设备 ~0.3s 内播「在」
+            _broadcast_wake(session.get("device_ip") or "")  # 单播+广播兜底
             print(
                 f"[{time.strftime('%H:%M:%S')}] [LIVE] 唤醒词命中（设备将滴声）"
                 f" kws={kws_hit!r} partial={partial!r}",
@@ -325,18 +326,38 @@ _SI_ADJ_CHARS = "斯师诗士司丝私"
 # 「司」不在此列：「上市公司」「开家公司」这类高频词会误触（11-13 实测）。
 _SI_FAR_CHARS = "斯师士诗使史市石"
 
-def _broadcast_wake() -> None:
-    """唤醒命中即时推送（2026-11-19）：UDP 广播到 18790，设备实时收包播
-    「在」——不等设备下一轮拉帧（最多省 ~0.7s 延迟）。失败静默。"""
+def _broadcast_wake(device_ip: str = "") -> None:
+    """唤醒命中即时推送（2026-11-19）：UDP 推到设备 :18790，设备实时收包播
+    「在」——不等设备下一轮拉帧（最多省 ~0.7s 延迟）。
+    2026-11-20 关键修正：公司 AP 客户端隔离会拦**广播**（设备 UDP 广播发现
+    中枢实测就失败），广播到不了设备=推送永远走不上。改**单播**到设备
+    HTTP 请求的来源 IP（note_device_ip 每 0.5s 刷新）——HTTP 回复包能到设备，
+    同路单播 UDP 一样能到。广播仅作兜底；都失败静默（bit0 标志路径兜底）。"""
+    targets = []
+    if device_ip:
+        targets.append((device_ip, 18790))
+    targets.append(("255.255.255.255", 18790))
     try:
         import socket
 
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        sock.sendto(b"SPARKBOT_WAKE", ("255.255.255.255", 18790))
+        for target in targets:
+            try:
+                sock.sendto(b"SPARKBOT_WAKE", target)
+            except Exception:  # noqa: BLE001
+                continue
         sock.close()
     except Exception:  # noqa: BLE001 - 推送失败不影响滴声标志兜底
         pass
+
+
+def note_device_ip(device_id: str, ip: str) -> None:
+    """记录设备的 HTTP 来源 IP（每次推流刷新），唤醒单播推送用。"""
+    with _lock:
+        session = _sessions.get(device_id)
+        if session is not None:
+            session["device_ip"] = ip
 
 
 def _wake_hit(text: str) -> bool:
@@ -506,6 +527,7 @@ def _finalize_utterance(
             session["beep_pending"] = True
             session["beep_armed"] = False
             session["last_beep_ts"] = now_ts
+            _broadcast_wake(session.get("device_ip") or "")  # 单播+广播兜底
             print(
                 f"[{time.strftime('%H:%M:%S')}] [LIVE] 定稿命中唤醒词（设备将滴声）: {refined!r}",
                 flush=True,

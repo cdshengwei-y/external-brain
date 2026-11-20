@@ -2383,22 +2383,22 @@ bool live_fetch_stream_frame() {
   }
   if (flags & 0x01) {
     // 唤醒命中应答「在」：UDP 推送（~0.3s 内到）与 bit0 标志（下一轮拉帧）
-    // 两条路，3s 冷却互斥防双响。
-    const bool cue_cooldown_ok = millis() - g_last_cue_ms > 3000;
+    // 两条路，3s 冷却互斥防双响。冷却必须在每条分支里**实时重算**——
+    // 循环开头算的值在 UDP 播完后就过期了，会让 bit0 再播一次（实测双响）。
     if (g_wake_udp_ok) {
       const int packet_size = g_wake_udp.parsePacket();
       if (packet_size > 0) {
         char packet_buf[32] = {0};
         const int read_len = g_wake_udp.read(packet_buf, sizeof(packet_buf) - 1);
         if (read_len >= 13 && strncmp(packet_buf, "SPARKBOT_WAKE", 13) == 0 &&
-            cue_cooldown_ok) {
+            millis() - g_last_cue_ms > 3000) {
           g_last_cue_ms = millis();
           Serial.println("[LIVE] wake push received (UDP)");
           play_zai_cue();
         }
       }
     }
-    if ((flags & 0x01) && cue_cooldown_ok) {
+    if ((flags & 0x01) && millis() - g_last_cue_ms > 3000) {
       g_last_cue_ms = millis();
       play_zai_cue();
     }
