@@ -1087,9 +1087,9 @@ void play_zai_cue() {
       reinterpret_cast<const int16_t*>(_tmp_sparkbot_wozai_20261106_pcm);
   const size_t total_samples = _tmp_sparkbot_wozai_20261106_pcm_len / 2;
 
-  // 「在」×2 ≈ 1.08s（一声太短听感单薄，两声刚好；全双工下实时排空，
-  // 每一声都完整）
-  for (int repeat = 0; repeat < 2; ++repeat) {
+  // 「在」单声 0.54s：全双工下 TX ring 实时排空，短片段也完整可听
+  // （旧架构短音频被 DMA 吃掉的问题随全双工消失）
+  for (int repeat = 0; repeat < 1; ++repeat) {
     size_t offset = 0;
     while (offset < total_samples) {
       const size_t samples = min(kChunkSamples, total_samples - offset);
@@ -2245,6 +2245,7 @@ uint8_t g_live_frame_flags = 0;
 WiFiUDP g_wake_udp;
 bool g_wake_udp_ok = false;
 unsigned long g_last_cue_ms = 0;  // 播放冷却：UDP 推送与 bit0 标志互斥防双响
+unsigned int consecutive_post_failures = 0;  // 连续推流失败计数（快速重试策略用）
 
 bool live_stream_reset() {
   WiFiClient client;
@@ -2479,10 +2480,23 @@ bool run_live_transcription() {
     // ② 推给中枢流式解码（响应很快，不做整段识别）
     const unsigned long http_started = millis();
     if (!live_stream_post(wav_mono_buffer, kStreamChunkFrames)) {
-      Serial.println("[LIVE] hub unreachable; UDP re-discovery");
-      discover_hub_via_udp();
-      delay(300);
-      continue;
+      // 快速重试（2026-11-20）：hub 端日志证明请求全都到达（200），丢的只是
+      // 回程响应包（设备 WiFi 收信号弱）。每次失败都做 2s UDP 重新发现，
+      // 字幕节奏就被拖垮。先立即重试一次；连续 3 次失败才重新发现。
+      if (live_stream_post(wav_mono_buffer, kStreamChunkFrames)) {
+        consecutive_post_failures = 0;
+      } else {
+        ++consecutive_post_failures;
+        Serial.printf("[LIVE] hub unreachable x%u\n", consecutive_post_failures);
+        if (consecutive_post_failures >= 3) {
+          consecutive_post_failures = 0;
+          discover_hub_via_udp();
+          delay(300);
+        }
+        continue;
+      }
+    } else {
+      consecutive_post_failures = 0;
     }
     // ③ 每轮都拉字幕帧（差量下发只有几 KB）——上屏节奏 ~0.7s
     live_fetch_stream_frame();
