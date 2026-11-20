@@ -1041,6 +1041,10 @@ void play_test_tone() {
 // 阻塞实时区（超过 ring 后写入按实时速率阻塞），后面的「在」就是实时流，
 // 与可听的 3s 长音完全同机制。
 void play_zai_cue() {
+  // 消咔（2026-11-19）：功放与背光共用 GPIO46，字幕模式下常开——I2S RX⇄TX
+  // 切换的电气瞬态会当「咔」漏到喇叭。先把 ES8311 DAC 音量打到最小静音，
+  // 切换完成由 configure_codec_for_playback 的序列恢复（0x32=0xB2）。
+  write_codec_register(0x32, 0x00);
   stop_i2s();
   codec_adc_ready = false;
   if (!start_i2s(I2S_MODE_TX)) {
@@ -1090,6 +1094,8 @@ void play_zai_cue() {
               &bytes_written, pdMS_TO_TICKS(1000));
     drain_written += samples;
   }
+  // 尾静音排水后同样把 DAC 打到静音，TX→RX 切换的瞬态不漏「咔」
+  write_codec_register(0x32, 0x00);
   stop_i2s();
   Serial.println("[LIVE] zai cue played");
 }
@@ -2434,6 +2440,21 @@ bool run_live_transcription() {
     if (!capture_pcm_block(wav_mono_buffer, kStreamChunkFrames)) {
       delay(200);
       continue;
+    }
+    // ①⑤ 采完立刻查唤醒推送（2026-11-19 提速）：不再等到 ②③ 之后，
+    // 命中→出声的平均延迟再省 0.3~0.5s
+    if (g_wake_udp_ok) {
+      const int wake_packet = g_wake_udp.parsePacket();
+      if (wake_packet > 0) {
+        char wake_buf[32] = {0};
+        const int wake_len = g_wake_udp.read(wake_buf, sizeof(wake_buf) - 1);
+        if (wake_len >= 13 && strncmp(wake_buf, "SPARKBOT_WAKE", 13) == 0 &&
+            millis() - g_last_cue_ms > 3000) {
+          g_last_cue_ms = millis();
+          Serial.println("[LIVE] wake push received (UDP, post-capture)");
+          play_zai_cue();
+        }
+      }
     }
     // ② 推给中枢流式解码（响应很快，不做整段识别）
     const unsigned long http_started = millis();
