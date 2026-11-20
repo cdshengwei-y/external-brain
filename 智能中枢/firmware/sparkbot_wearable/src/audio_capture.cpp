@@ -141,6 +141,7 @@ bool i2s_started = false;
 // 每次重配 + 重启 I2S 时钟，功放（和背光共用 GPIO46，一直是使能状态）
 // 都会把这声「咔」放大出来——这就是用户听到的「每隔几秒冒一声」。
 bool codec_adc_ready = false;
+bool codec_dac_ready = false;  // 全双工：DAC 配置一次即可，播放路径不再重配
 
 int16_t capture_buffer[kCaptureBufferSamples];
 int16_t* wav_mono_buffer = nullptr;
@@ -427,17 +428,22 @@ bool configure_codec_for_playback() {
 }
 
 bool start_i2s(i2s_mode_t direction) {
+  // 全双工重构（2026-11-20）：I2S 以 RX+TX 双向模式安装一次、永不切换。
+  // 旧方案在 RX⇄TX 间反复重装驱动，每次切换都有电气瞬态漏进常开的功放
+  // （咔声），还要 100~200ms 重配置延迟，且播音期间采音中断。全双工下
+  // 采音与播音并行：短提示音实时播出、字幕流不因播「在」而断流。
+  // direction 参数保留兼容旧调用点，实际忽略。
+  (void)direction;
   if (i2s_started) {
     return true;
   }
 
   const i2s_config_t config = {
-      .mode = static_cast<i2s_mode_t>(I2S_MODE_MASTER | direction),
+      .mode = static_cast<i2s_mode_t>(I2S_MODE_MASTER | I2S_MODE_TX |
+                                      I2S_MODE_RX),
       .sample_rate = kSampleRate,
       .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
-      .channel_format = direction == I2S_MODE_TX
-                            ? I2S_CHANNEL_FMT_ONLY_LEFT
-                            : I2S_CHANNEL_FMT_RIGHT_LEFT,
+      .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
       .communication_format = I2S_COMM_FORMAT_STAND_I2S,
       .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
       // 4×256 只有 32ms 的缓冲，播放时每写一块还要画一次屏（240×190×2 走 40MHz SPI
@@ -496,6 +502,8 @@ void stop_i2s() {
   i2s_stop(kI2sPort);
   i2s_driver_uninstall(kI2sPort);
   i2s_started = false;
+  codec_adc_ready = false;
+  codec_dac_ready = false;  // 驱动卸载后两个 codec 配置都要重新跑
 }
 
 void capture_audio() {
@@ -868,24 +876,42 @@ void enter_standby_state(bool show_sleepy = true) {
 // 顺序必须是「先备通路 → 亮屏 → 出声」：功放和背光共用 GPIO46，
 // 黑屏里出声就是哑的；备好之后亮屏与出声只隔一个 delay(20)，肉眼即同步。
 bool prepare_wakeup_playback() {
-  // 待机时 I2S 是常开的 RX 模式，切 TX 必须重装驱动（start_i2s 对已启动直接返回）
-  stop_i2s();
-  codec_adc_ready = false;
+  // 全双工（2026-11-20）：I2S 常开不切换，DAC 配置只需一次（codec_dac_ready）
   if (!start_i2s(I2S_MODE_TX)) {
     return false;
   }
-  if (!configure_codec_for_playback()) {
-    Serial.println("[AUDIO] ES8311 playback configuration failed; stopping I2S");
-    stop_i2s();
-    return false;
+  if (!codec_dac_ready) {
+    if (!configure_codec_for_playback()) {
+      Serial.println("[AUDIO] ES8311 playback configuration failed");
+      return false;
+    }
+    codec_dac_ready = true;
   }
   return true;
 }
 
-// 按 chunk 把一段裸 PCM 推给 I2S；drive_mouth=true 时嘴型随音量张合
+// 单声道 int16 → 立体声交错（全双工 I2S 是双声道帧格式；ES8311 的 DAC
+// 只取其中一个 slot，左右都填同一份样本则无论选哪个 slot 都能出声）
+size_t mono_to_stereo(const int16_t* mono, size_t mono_samples,
+                      int16_t* stereo, size_t stereo_capacity_samples) {
+  size_t out = 0;
+  for (size_t index = 0; index < mono_samples; ++index) {
+    if (out + 2 > stereo_capacity_samples) {
+      break;
+    }
+    stereo[out++] = mono[index];
+    stereo[out++] = mono[index];
+  }
+  return out;
+}
+
+// 按 chunk 把一段裸 PCM 推给 I2S；drive_mouth=true 时嘴型随音量张合。
+// 全双工（2026-11-20）：不再 stop_i2s/清 DMA——TX ring 实时排空，播完
+// 自然静音，采音全程不间断。
 void play_pcm_clip(const unsigned char* pcm_data, unsigned int pcm_len, bool drive_mouth) {
   constexpr size_t kMonoChunkSamples = 1024;
   int16_t mono_buffer[kMonoChunkSamples];
+  int16_t stereo_buffer[kMonoChunkSamples * 2];
   const int16_t* pcm_samples = reinterpret_cast<const int16_t*>(pcm_data);
   size_t offset = 0;
   uint32_t chunk_index = 0;
@@ -900,14 +926,16 @@ void play_pcm_clip(const unsigned char* pcm_data, unsigned int pcm_len, bool dri
       const int32_t magnitude = abs(static_cast<int32_t>(mono_buffer[index]));
       if (magnitude > chunk_peak) chunk_peak = magnitude;
     }
+    const size_t stereo_samples = mono_to_stereo(
+        mono_buffer, samples, stereo_buffer, kMonoChunkSamples * 2);
 
     size_t bytes_written = 0;
     const esp_err_t write_error = i2s_write(kI2sPort,
-                                            mono_buffer,
-                                            samples * sizeof(int16_t),
+                                            stereo_buffer,
+                                            stereo_samples * sizeof(int16_t),
                                             &bytes_written,
                                             pdMS_TO_TICKS(1000));
-    if (write_error != ESP_OK || bytes_written != samples * sizeof(int16_t)) {
+    if (write_error != ESP_OK || bytes_written != stereo_samples * sizeof(int16_t)) {
       Serial.printf("[AUDIO] playback failed: error=%s bytes=%u\n",
                     esp_err_to_name(write_error),
                     static_cast<unsigned int>(bytes_written));
@@ -926,10 +954,6 @@ void play_pcm_clip(const unsigned char* pcm_data, unsigned int pcm_len, bool dri
     offset += samples;
   }
 
-  i2s_zero_dma_buffer(kI2sPort);
-  delay(30);
-  // 同上：GPIO46 与背光共用，保持高电平，避免功放使能翻转的「咔」声
-  stop_i2s();
 #ifdef PET_FOUNTAIN
   face::reset_amp();
 #endif
@@ -971,16 +995,16 @@ void play_wakeup_audio() {
 }
 
 void play_test_tone() {
-  // 待机时 I2S 是常开的 RX 模式，切 TX 必须重装驱动（start_i2s 对已启动直接返回）
-  stop_i2s();
-  codec_adc_ready = false;
+  // 全双工（2026-11-20）：I2S 常开，DAC 配置一次；不再切换/清 DMA
   if (!start_i2s(I2S_MODE_TX)) {
     return;
   }
-  if (!configure_codec_for_playback()) {
-    Serial.println("[AUDIO] ES8311 playback configuration failed; stopping I2S");
-    stop_i2s();
-    return;
+  if (!codec_dac_ready) {
+    if (!configure_codec_for_playback()) {
+      Serial.println("[AUDIO] ES8311 playback configuration failed");
+      return;
+    }
+    codec_dac_ready = true;
   }
 
   digitalWrite(kPowerAmpEnablePin, HIGH);
@@ -992,6 +1016,7 @@ void play_test_tone() {
   constexpr float kToneFrequency = 1000.0F;
   constexpr float kAmplitude = 12000.0F;
   int16_t tone_buffer[kChunkSamples];
+  int16_t stereo_buffer[kChunkSamples * 2];
   size_t offset = 0;
   bool write_failed = false;
   while (offset < kToneSamples) {
@@ -1002,11 +1027,13 @@ void play_test_tone() {
           static_cast<float>(kSampleRate);
       tone_buffer[index] = static_cast<int16_t>(sinf(phase) * kAmplitude);
     }
+    const size_t stereo_samples = mono_to_stereo(
+        tone_buffer, samples, stereo_buffer, kChunkSamples * 2);
 
     size_t bytes_written = 0;
     const esp_err_t write_error = i2s_write(kI2sPort,
-                                            tone_buffer,
-                                            samples * sizeof(int16_t),
+                                            stereo_buffer,
+                                            stereo_samples * sizeof(int16_t),
                                             &bytes_written,
                                             pdMS_TO_TICKS(1000));
     if (write_error != ESP_OK || bytes_written != samples * sizeof(int16_t)) {
@@ -1019,10 +1046,8 @@ void play_test_tone() {
     offset += samples;
   }
 
-  i2s_zero_dma_buffer(kI2sPort);
-  delay(30);
-  // GPIO46 与背光共用，保持高电平，避免功放使能翻转的「咔」声
-  stop_i2s();
+  // 全双工：不清 DMA、不停 I2S——TX ring 实时排空后自然静音，
+  // 采音全程不间断（清 DMA 会把 RX ring 里已采的字幕音频一起清掉）
   if (!write_failed) {
     Serial.println("[AUDIO] 1kHz tone completed");
   }
@@ -1041,62 +1066,44 @@ void play_test_tone() {
 // 阻塞实时区（超过 ring 后写入按实时速率阻塞），后面的「在」就是实时流，
 // 与可听的 3s 长音完全同机制。
 void play_zai_cue() {
-  // 消咔（2026-11-19）：功放与背光共用 GPIO46，字幕模式下常开——I2S RX⇄TX
-  // 切换的电气瞬态会当「咔」漏到喇叭。先把 ES8311 DAC 音量打到最小静音，
-  // 切换完成由 configure_codec_for_playback 的序列恢复（0x32=0xB2）。
-  write_codec_register(0x32, 0x00);
-  stop_i2s();
-  codec_adc_ready = false;
+  // 全双工（2026-11-20）：I2S 常开，写完即走——TX ring 实时排空，「在」
+  // 播完自然静音；采音全程不间断，无模式切换 = 无咔。
   if (!start_i2s(I2S_MODE_TX)) {
     return;
   }
-  if (!configure_codec_for_playback()) {
-    Serial.println("[LIVE] zai: ES8311 playback config failed");
-    stop_i2s();
-    return;
+  if (!codec_dac_ready) {
+    if (!configure_codec_for_playback()) {
+      Serial.println("[LIVE] zai: ES8311 playback config failed");
+      return;
+    }
+    codec_dac_ready = true;
   }
-  digitalWrite(kPowerAmpEnablePin, HIGH);
-  delay(20);
 
   constexpr size_t kChunkSamples = 256;
-  int16_t voice_chunk[kChunkSamples];
+  int16_t mono_chunk[kChunkSamples];
+  int16_t stereo_chunk[kChunkSamples * 2];
 
   const int16_t* pcm_samples =
       reinterpret_cast<const int16_t*>(_tmp_sparkbot_wozai_20261106_pcm);
   const size_t total_samples = _tmp_sparkbot_wozai_20261106_pcm_len / 2;
 
-  // 「在」单声 0.54s（在前 1.5s 可听窗口内）+ 1.6s 静音排水（write 按实时
-  // 速率阻塞，保证「在」完整放完才停 I2S）——最后一个未试组合。
-  for (int repeat = 0; repeat < 1; ++repeat) {
+  // 「在」×2 ≈ 1.08s（一声太短听感单薄，两声刚好；全双工下实时排空，
+  // 每一声都完整）
+  for (int repeat = 0; repeat < 2; ++repeat) {
     size_t offset = 0;
     while (offset < total_samples) {
       const size_t samples = min(kChunkSamples, total_samples - offset);
       for (size_t index = 0; index < samples; ++index) {
-        voice_chunk[index] = pcm_samples[offset + index];
+        mono_chunk[index] = pcm_samples[offset + index] / kPlaybackVolumeDivisor;
       }
+      const size_t stereo_samples = mono_to_stereo(
+          mono_chunk, samples, stereo_chunk, kChunkSamples * 2);
       size_t bytes_written = 0;
-      i2s_write(kI2sPort, voice_chunk, samples * sizeof(int16_t),
+      i2s_write(kI2sPort, stereo_chunk, stereo_samples * sizeof(int16_t),
                 &bytes_written, pdMS_TO_TICKS(1000));
       offset += samples;
     }
   }
-
-  // 排水（2026-11-19 用户实测第二声「在」突然消失）：写 1.6s 静音把还压在
-  // DMA ring 里的尾巴实时放完——write 会按实时速率阻塞，尾巴放完才返回，
-  // 再 stop_i2s 就不会拦腰切断。
-  static int16_t silence_chunk[kChunkSamples];  // 静态零初始化 = 静音
-  size_t drain_written = 0;
-  const size_t drain_samples = kSampleRate * 16 / 10;
-  while (drain_written < drain_samples) {
-    const size_t samples = min(kChunkSamples, drain_samples - drain_written);
-    size_t bytes_written = 0;
-    i2s_write(kI2sPort, silence_chunk, samples * sizeof(int16_t),
-              &bytes_written, pdMS_TO_TICKS(1000));
-    drain_written += samples;
-  }
-  // 尾静音排水后同样把 DAC 打到静音，TX→RX 切换的瞬态不漏「咔」
-  write_codec_register(0x32, 0x00);
-  stop_i2s();
   Serial.println("[LIVE] zai cue played");
 }
 
@@ -1780,20 +1787,22 @@ bool play_response_audio(const String& request_id) {
     return false;
   }
 
-  // 预缓冲够一小段就切 TX 开播；下载期间 I2S 仍保持 RX 常开不变
-  stop_i2s();
-  codec_adc_ready = false;
+  // 全双工（2026-11-20）：I2S 常开不切换，DAC 配置一次；回复播放期间
+  // 采音照常进行，字幕流不断
   if (!start_i2s(I2S_MODE_TX)) {
     free(pcm_data);
     http.end();
     return false;
   }
-  if (!configure_codec_for_playback()) {
-    Serial.println("[AUDIO] ES8311 response playback configuration failed");
-    stop_i2s();
-    free(pcm_data);
-    http.end();
-    return false;
+  if (!codec_dac_ready) {
+    if (!configure_codec_for_playback()) {
+      Serial.println("[AUDIO] ES8311 response playback configuration failed");
+      stop_i2s();
+      free(pcm_data);
+      http.end();
+      return false;
+    }
+    codec_dac_ready = true;
   }
 
   digitalWrite(kPowerAmpEnablePin, HIGH);
@@ -1804,6 +1813,7 @@ bool play_response_audio(const String& request_id) {
   // 每块 2048 字节 = 64ms 音频。原来 512 字节一块，每块都要推到屏幕一次，
   // 屏幕刷一次要 ~18ms，喂数速度跟不上播放速度，就会出现卡顿+重复的破音。
   uint8_t pcm_buffer[2048];
+  int16_t stereo_buffer[(sizeof(pcm_buffer) / sizeof(int16_t)) * 2];
   bool success = true;
   uint32_t played = 0;
   uint32_t chunk_index = 0;
@@ -1857,10 +1867,17 @@ bool play_response_audio(const String& request_id) {
       }
       // 先把音频写进 DMA（阻塞式，会自动等空间），再去画屏，
       // 这样画屏耗掉的时间由 128ms 的 DMA 缓冲兜着，不会把音频抽干。
+      // 全双工 TX 是立体声帧格式：单声道数据复制到左右两个 slot。
+      const size_t mono_samples = wanted / sizeof(int16_t);
+      const size_t stereo_samples = mono_to_stereo(
+          pcm_samples, mono_samples, stereo_buffer,
+          sizeof(stereo_buffer) / sizeof(int16_t));
       size_t bytes_written = 0;
       const esp_err_t write_error = i2s_write(
-          kI2sPort, pcm_buffer, wanted, &bytes_written, pdMS_TO_TICKS(1000));
-      if (write_error != ESP_OK || bytes_written != wanted) {
+          kI2sPort, stereo_buffer, stereo_samples * sizeof(int16_t),
+          &bytes_written, pdMS_TO_TICKS(1000));
+      if (write_error != ESP_OK ||
+          bytes_written != stereo_samples * sizeof(int16_t)) {
         Serial.printf("[AUDIO] response playback failed: error=%s bytes=%u\n",
                       esp_err_to_name(write_error),
                       static_cast<unsigned int>(bytes_written));
@@ -1881,8 +1898,12 @@ bool play_response_audio(const String& request_id) {
       // 的轮询越密，链路一恢复就能立刻接上，少吞一截内容。播放路径仍用 2048，
       // 那是为了减少画屏次数，两者诉求相反，别统一。
       memset(pcm_buffer, 0, sizeof(pcm_buffer));
+      const size_t stereo_silence = mono_to_stereo(
+          reinterpret_cast<const int16_t*>(pcm_buffer), 256, stereo_buffer,
+          sizeof(stereo_buffer) / sizeof(int16_t));
       size_t bytes_written = 0;
-      i2s_write(kI2sPort, pcm_buffer, 512, &bytes_written, pdMS_TO_TICKS(200));
+      i2s_write(kI2sPort, stereo_buffer, stereo_silence * sizeof(int16_t),
+                &bytes_written, pdMS_TO_TICKS(200));
       underrun_bytes += 512;
       ++underrun_chunks;
 #ifdef PET_FOUNTAIN
@@ -1899,12 +1920,11 @@ bool play_response_audio(const String& request_id) {
 
   http.end();
   free(pcm_data);
-  i2s_zero_dma_buffer(kI2sPort);
-  delay(30);
-  stop_i2s();
+  // 全双工（2026-11-20）：不清 DMA、不停 I2S——TX ring 实时排空后自然
+  // 静音，采音全程不间断（清/停都会打断字幕流并产生切换咔声）。
   // GPIO46 是「背光 + 功放使能」共用脚，表情首页要常亮就必须一直是高电平。
   // 之前这里先拉低再拉高，功放使能翻转会在喇叭里「咔」一声（实测每隔几秒一次），
-  // 所以播放结束不再动它。留 30ms 静音把最后一块音频播完再停 I2S 就够了。
+  // 所以播放结束不再动它。
 #ifdef PET_FOUNTAIN
   face::reset_amp();
 #endif
