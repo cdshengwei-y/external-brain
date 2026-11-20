@@ -2452,20 +2452,12 @@ bool run_live_transcription() {
   g_wake_udp_ok = (g_wake_udp.begin(18790) == 1);
   Serial.println(g_wake_udp_ok ? "[LIVE] wake push listener on :18790"
                                : "[LIVE] wake push listener bind failed");
-  // 播放通路预热（2026-11-20）：DAC 首次配置（I2C 序列 ~0.2s）+ DMA 首次
-  // 分配都发生在第一次播放时——用户实测烧录/重启后的第一次「在」明显偏慢。
-  // 开机先静音把整条通路跑热，第一次喊就是热路径速度。
-  if (prepare_wakeup_playback()) {
-    static int16_t warm_silence[256];
-    memset(warm_silence, 0, sizeof(warm_silence));
-    const size_t warm_samples = kSampleRate / 2;  // 0.5s 静音，功放无感
-    for (size_t written = 0; written < warm_samples; written += 256) {
-      size_t bytes_written = 0;
-      i2s_write(kI2sPort, warm_silence, 256 * sizeof(int16_t), &bytes_written,
-                pdMS_TO_TICKS(1000));
-    }
-    Serial.println("[LIVE] playback path warmed up");
-  }
+  // ⚠️ 播放通路预热已撤（2026-11-20）：DAC 配置序列（esp_codec_dev open
+  // sequence）会改写若干 ADC 配置不恢复的寄存器（0x12/0x31/0x32 等），
+  // 全双工下 DAC 先配、ADC 后配也救不回来——麦克风从此全零（rms=-99，
+  // 用户实测字幕不出字）。首次播放的 ~0.2s DAC 配置开销不值得这个代价，
+  // 预热撤除；若将来要做，必须先补齐「播放序列改写了哪些 ADC 寄存器」的
+  // 完整清单并在预热后逐一恢复。
   while (true) {
     if (Serial.available() > 0) {
       Serial.println("[LIVE] interrupted by serial input");
